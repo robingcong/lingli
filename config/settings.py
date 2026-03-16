@@ -170,10 +170,23 @@ LLM_PROVIDERS = {
     },
 }
 
+TEST_CASE_GENERATION_CONFIG = {
+    "generation_temperature": env_float("TEST_CASE_GENERATION_TEMPERATURE", 0.3),
+    "review_temperature": env_float("TEST_CASE_REVIEW_TEMPERATURE", 0.2),
+    "default_target_count": env_int("TEST_CASE_DEFAULT_TARGET_COUNT", 8),
+    "candidate_multiplier": env_int("TEST_CASE_CANDIDATE_MULTIPLIER", 2),
+    "minimum_candidate_count": env_int("TEST_CASE_MINIMUM_CANDIDATE_COUNT", 8),
+    "min_review_score": env_int("TEST_CASE_MIN_REVIEW_SCORE", 7),
+    "max_supplement_rounds": env_int("TEST_CASE_MAX_SUPPLEMENT_ROUNDS", 2),
+    "max_total_rounds": env_int("TEST_CASE_MAX_TOTAL_ROUNDS", 3),
+    "dedupe_similarity_threshold": env_float("TEST_CASE_DEDUPE_SIMILARITY", 0.72),
+    "keyword_overlap_threshold": env_float("TEST_CASE_KEYWORD_OVERLAP", 0.6),
+}
+
 VECTOR_DB_CONFIG = {
     "host": os.getenv("MILVUS_HOST", "127.0.0.1"),
     "port": os.getenv("MILVUS_PORT", "19530"),
-    "collection_name": os.getenv("MILVUS_COLLECTION", "vv_knowledge_collection"),
+    "collection_name": os.getenv("MILVUS_COLLECTION", "vv_rag_markdown_chunks"),
 }
 
 PLANE_CONFIG = {

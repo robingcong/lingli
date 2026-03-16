@@ -34,7 +34,9 @@ export const api = {
   getRuleTemplate: () => apiGet('/api/testcase-rule-template/'),
 
   refreshPlaneWorkItems: (payload) => apiPostJson('/api/plane-work-items/', payload),
-  listPlaneWorkItems: ({ page = 1, pageSize = 20, keyword = '' } = {}) =>
-    apiGet(`/api/plane-work-items/?page=${page}&page_size=${pageSize}&keyword=${encodeURIComponent(keyword)}`),
+  listPlaneWorkItems: ({ page = 1, pageSize = 20, keyword = '', projectId = '' } = {}) =>
+    apiGet(
+      `/api/plane-work-items/?page=${page}&page_size=${pageSize}&keyword=${encodeURIComponent(keyword)}&project_id=${encodeURIComponent(projectId)}`
+    ),
   planeOneClickGenerate: (payload) => apiPostJson('/api/plane-one-click-generate/', payload)
 };

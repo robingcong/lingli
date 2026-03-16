@@ -14,6 +14,16 @@ class LLMErrorMappingTests(unittest.TestCase):
         self.assertEqual(status, 502)
         self.assertIn("502", msg)
 
+    def test_map_connection_error_to_503(self):
+        status, msg = _map_llm_error(Exception("Connection error."))
+        self.assertEqual(status, 503)
+        self.assertIn("连接失败", msg)
+
+    def test_map_timeout_error_to_504(self):
+        status, msg = _map_llm_error(Exception("Read timeout while contacting upstream"))
+        self.assertEqual(status, 504)
+        self.assertIn("超时", msg)
+
     def test_map_generic_error_to_500(self):
         status, msg = _map_llm_error(Exception("some parse error"))
         self.assertEqual(status, 500)

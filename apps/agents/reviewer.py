@@ -1,4 +1,5 @@
-﻿from typing import Dict, Any
+from typing import Dict, Any
+import json
 
 from ..llm.base import BaseLLMService
 from ..knowledge.service import KnowledgeService
@@ -16,17 +17,22 @@ class TestCaseReviewerAgent:
         self.prompt = TestCaseReviewerPrompt()
         self.logger = get_logger(self.__class__.__name__)
 
-    def review(self, test_case: TestCase) -> Dict[str, Any]:
-        """评审测试用例"""
-        try:
-            self.logger.info("待评审的测试用例数据: \n%s", test_case)
-            test_case_dict = {
+    def review(self, test_case: TestCase) -> str:
+        """评审测试用例并返回原始JSON字符串。"""
+        payload = self.review_case_data(
+            {
                 "description": test_case.description,
                 "test_steps": test_case.test_steps,
                 "expected_results": test_case.expected_results,
             }
+        )
+        return payload["raw_text"]
 
-            messages = self.prompt.format_messages(test_case_dict)
+    def review_case_data(self, test_case_data: Dict[str, Any]) -> Dict[str, Any]:
+        """评审测试用例数据并返回结构化结果。"""
+        try:
+            self.logger.info("待评审的测试用例数据: \n%s", test_case_data)
+            messages = self.prompt.format_messages(test_case_data)
             self.logger.info("构建后的评审提示词: \n%s", messages)
 
             result = self.llm_service.invoke(messages)
@@ -34,11 +40,31 @@ class TestCaseReviewerAgent:
             cleaned = self._extract_json(raw_text)
             if cleaned != raw_text:
                 self.logger.info("评审结果已截取为JSON片段")
-            return cleaned
 
+            parsed = self._parse_review_json(cleaned)
+            return {
+                "raw_text": cleaned,
+                "parsed": parsed,
+                "score": parsed.get("score"),
+                "recommendation": parsed.get("recommendation", ""),
+            }
         except Exception as e:
             self.logger.error("评审过程出错: %s", str(e), exc_info=True)
             raise Exception(f"评审失败: {str(e)}")
+
+    def _parse_review_json(self, text: str) -> Dict[str, Any]:
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        return {
+            "score": 0,
+            "recommendation": "不通过",
+            "comments": text,
+            "missing_scenarios": [],
+        }
 
     def _extract_json(self, text: str) -> str:
         """从模型输出中截取JSON对象或数组字符串"""

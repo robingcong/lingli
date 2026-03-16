@@ -16,8 +16,9 @@ class BGEM3Embedder:
         Args:
             model_name: 模型名称，默认为'BAAI/bge-m3'
         """
+        resolved_model_name = "BAAI/bge-m3" if model_name == "bge-m3" else model_name
         print("正在加载BGE-M3模型...")
-        self.model = SentenceTransformer(model_name)
+        self.model = SentenceTransformer(resolved_model_name)
 
         
     def get_embeddings(self, texts: Union[str, List[str]], show_progress_bar: bool = False) -> List[List[float]]:

@@ -161,15 +161,34 @@ def generate(request):
     case_design_methods = data.get('case_design_methods') or default_case_design_methods
     case_categories = data.get('case_categories') or default_case_categories
     case_count = int(data.get('case_count', 0))
+    generation_quality_config = dict(getattr(settings, "TEST_CASE_GENERATION_CONFIG", {}))
     
     logger.info(f"接收到的数据: {json.dumps(data, ensure_ascii=False)}")
     
     try:
         logger.info(f"使用 {llm_provider} 生成测试用例...")
-        llm_service = LLMServiceFactory.create(llm_provider, **PROVIDERS.get(llm_provider, {}))
-        
-        
-        generator_agent = TestCaseGeneratorAgent(llm_service=llm_service, knowledge_service=knowledge_service, case_design_methods=case_design_methods, case_categories=case_categories, case_count=case_count)
+        provider_config = dict(PROVIDERS.get(llm_provider, {}))
+        provider_config.pop("temperature", None)
+        llm_service = LLMServiceFactory.create(
+            llm_provider,
+            **provider_config,
+            temperature=generation_quality_config.get("generation_temperature", 0.3),
+        )
+        reviewer_llm_service = LLMServiceFactory.create(
+            llm_provider,
+            **provider_config,
+            temperature=generation_quality_config.get("review_temperature", 0.2),
+        )
+        reviewer_agent = TestCaseReviewerAgent(reviewer_llm_service, knowledge_service)
+        generator_agent = TestCaseGeneratorAgent(
+            llm_service=llm_service,
+            knowledge_service=knowledge_service,
+            case_design_methods=case_design_methods,
+            case_categories=case_categories,
+            case_count=case_count,
+            reviewer_agent=reviewer_agent,
+            quality_config=generation_quality_config,
+        )
         logger.info(f"开始生成测试用例- 需求: {requirements}...")
         logger.info(f"选择的用例设计方法 {case_design_methods}")
         logger.info(f"选择的用例类型 {case_categories}")
@@ -316,19 +335,17 @@ def case_review(request):
         
         logger.info("调用测试用例审核Agent...")
         test_case_reviewer = TestCaseReviewerAgent(llm_service, knowledge_service)
-        review_result = test_case_reviewer.review(test_case)
-        logger.info(f"审核完成，结果: {review_result}")
-        
-        review_content = review_result.content if hasattr(review_result, 'content') else str(review_result)
-
-        score = None
-        recommendation = ""
-        try:
-            parsed = json.loads(review_content)
-            score = parsed.get("score")
-            recommendation = parsed.get("recommendation", "")
-        except Exception:
-            parsed = None
+        review_payload = test_case_reviewer.review_case_data(
+            {
+                "description": test_case.description,
+                "test_steps": test_case.test_steps,
+                "expected_results": test_case.expected_results,
+            }
+        )
+        review_content = review_payload["raw_text"]
+        score = review_payload.get("score")
+        recommendation = review_payload.get("recommendation", "")
+        logger.info(f"审核完成，结果: {review_content}")
 
         TestCaseAIReview.objects.update_or_create(
             test_case=test_case,

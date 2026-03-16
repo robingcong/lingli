@@ -23,7 +23,7 @@ class MilvusVectorStore:
         self.collection_name = (
             collection_name
             or vector_cfg.get("collection_name")
-            or os.getenv("MILVUS_COLLECTION", "vv_knowledge_collection")
+            or os.getenv("MILVUS_COLLECTION", "vv_rag_markdown_chunks")
         )
 
         self._connect()
@@ -89,28 +89,59 @@ class MilvusVectorStore:
         collection = Collection(self.collection_name)
         collection.load()
 
+        # 兼容不同集合schema：仅请求当前集合真实存在的字段，避免因字段缺失导致查询失败
+        scalar_fields = [
+            field.name for field in collection.schema.fields if field.dtype != DataType.FLOAT_VECTOR
+        ]
+        preferred_output_fields = [
+            "content",
+            "text",
+            "chunk",
+            "chunk_text",
+            "metadata",
+            "source",
+            "source_path",
+            "doc_type",
+            "chunk_id",
+            "upload_time",
+            "section_path",
+            "title",
+        ]
+        output_fields = [name for name in preferred_output_fields if name in scalar_fields]
+        if not output_fields:
+            output_fields = [name for name in scalar_fields if name != "id"][:10]
+
         search_params = {"metric_type": "COSINE", "params": {"ef": 32}}
         results = collection.search(
             data=[query_vector],
             anns_field="embedding",
             param=search_params,
             limit=top_k,
-            output_fields=["content", "metadata", "source", "doc_type", "chunk_id", "upload_time"],
+            output_fields=output_fields,
         )
 
         ret = []
         for hits in results:
             for hit in hits:
+                entity_data = {name: hit.entity.get(name) for name in output_fields}
+                content = (
+                    entity_data.get("content")
+                    or entity_data.get("text")
+                    or entity_data.get("chunk")
+                    or entity_data.get("chunk_text")
+                )
                 ret.append(
                     {
                         "id": hit.id,
                         "score": hit.score,
-                        "content": hit.entity.get("content"),
-                        "metadata": hit.entity.get("metadata"),
-                        "source": hit.entity.get("source"),
-                        "doc_type": hit.entity.get("doc_type"),
-                        "chunk_id": hit.entity.get("chunk_id"),
-                        "upload_time": hit.entity.get("upload_time"),
+                        "content": content,
+                        "metadata": entity_data.get("metadata"),
+                        "source": entity_data.get("source") or entity_data.get("source_path"),
+                        "doc_type": entity_data.get("doc_type"),
+                        "chunk_id": entity_data.get("chunk_id"),
+                        "upload_time": entity_data.get("upload_time"),
+                        "section_path": entity_data.get("section_path"),
+                        "title": entity_data.get("title"),
                     }
                 )
 

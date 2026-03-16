@@ -17,6 +17,12 @@
 
       <div class="flex" style="margin-top: 12px;">
         <button @click="refreshFromPlane" :disabled="refreshing">手动刷新 Plane</button>
+        <select v-model="projectId" style="max-width: 260px;" @change="onProjectChange">
+          <option value="">全部项目</option>
+          <option v-for="p in projects" :key="p.project_id" :value="p.project_id">
+            {{ p.project_name || p.project_id }}
+          </option>
+        </select>
         <input v-model="keyword" placeholder="搜索项目/标题/内容" style="max-width: 280px;" />
         <button class="secondary" @click="loadPlaneItems" :disabled="loadingItems">查询</button>
       </div>
@@ -91,8 +97,8 @@
         </tbody>
       </table>
       <div class="flex" style="margin-top: 12px;">
-        <button @click="save" :disabled="saving">保存到数据库</button>
         <span v-if="saveMessage" class="notice">{{ saveMessage }}</span>
+        <span v-if="effectiveProvider" class="notice">实际使用模型：{{ effectiveProvider }}</span>
       </div>
     </div>
   </div>
@@ -103,7 +109,6 @@ import { onMounted, reactive, ref } from 'vue';
 import { api } from '../api/endpoints';
 
 const providers = ref([]);
-const saving = ref(false);
 const refreshing = ref(false);
 const loadingItems = ref(false);
 const oneClickLoading = ref(false);
@@ -112,6 +117,7 @@ const generateError = ref('');
 const saveMessage = ref('');
 const refreshMessage = ref('');
 const testCases = ref([]);
+const effectiveProvider = ref('');
 
 const form = reactive({
   llm_provider: 'deepseek',
@@ -125,6 +131,8 @@ const pageSize = ref(20);
 const totalPages = ref(1);
 const total = ref(0);
 const planeItems = ref([]);
+const projects = ref([]);
+const projectId = ref('');
 const selectedId = ref(null);
 
 onMounted(async () => {
@@ -153,11 +161,16 @@ async function loadPlaneItems() {
     const data = await api.listPlaneWorkItems({
       page: page.value,
       pageSize: pageSize.value,
-      keyword: keyword.value
+      keyword: keyword.value,
+      projectId: projectId.value
     });
     planeItems.value = data.items || [];
+    projects.value = data.projects || [];
     total.value = data.total || 0;
     totalPages.value = data.total_pages || 1;
+    if (selectedId.value && !planeItems.value.some((item) => String(item.id) === String(selectedId.value))) {
+      selectedId.value = null;
+    }
   } catch (e) {
     error.value = e.message || '加载 Plane 工作项失败。';
   } finally {
@@ -184,6 +197,8 @@ async function refreshFromPlane() {
 async function oneClickGenerate(itemId = null) {
   generateError.value = '';
   saveMessage.value = '';
+  effectiveProvider.value = '';
+  testCases.value = [];
   const targetId = itemId || selectedId.value;
   if (!targetId) {
     generateError.value = '请先选择一个 Plane 工作项。';
@@ -196,29 +211,16 @@ async function oneClickGenerate(itemId = null) {
       llm_provider: form.llm_provider,
       case_count: form.case_count
     });
+    testCases.value = data.test_cases || [];
+    effectiveProvider.value = data.effective_provider || form.llm_provider;
     saveMessage.value = data.message || '一键生成并保存成功。';
+    if (effectiveProvider.value && effectiveProvider.value !== form.llm_provider) {
+      saveMessage.value += ` 已自动切换到 ${effectiveProvider.value}。`;
+    }
   } catch (e) {
     generateError.value = e.message || '一键生成失败。';
   } finally {
     oneClickLoading.value = false;
-  }
-}
-
-async function save() {
-  if (!testCases.value.length) return;
-  saving.value = true;
-  saveMessage.value = '';
-  try {
-    const data = await api.saveCases({
-      requirement: form.requirements,
-      test_cases: testCases.value,
-      llm_provider: form.llm_provider
-    });
-    saveMessage.value = data.message || '保存成功。';
-  } catch (e) {
-    saveMessage.value = e.message || '保存失败。';
-  } finally {
-    saving.value = false;
   }
 }
 
@@ -234,9 +236,15 @@ function nextPage() {
   loadPlaneItems();
 }
 
+function onProjectChange() {
+  page.value = 1;
+  loadPlaneItems();
+}
+
 function reset() {
   testCases.value = [];
   generateError.value = '';
   saveMessage.value = '';
+  effectiveProvider.value = '';
 }
 </script>

@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Optional
 import os
 import time
+import threading
 from dotenv import load_dotenv
 from utils.logger_manager import get_logger
 from django.conf import settings
@@ -78,8 +79,105 @@ class BaseLLMService(BaseChatModel):
         """返回LLM类型"""
         return "base_llm_service"
 
+
+def _is_qwen_fallback_error(error: Exception) -> bool:
+    """判断错误是否应该自动切换到 qwen。"""
+    message = str(error).lower()
+    markers = (
+        "502",
+        "bad gateway",
+        "gateway",
+        "upstream",
+        "unsupported",
+        "not supported",
+        "does not support",
+        "model not found",
+        "no such model",
+        "invalid model",
+    )
+    return any(marker in message for marker in markers)
+
+
+class _FallbackChatModelProxy:
+    """在主 provider 失败时透明降级到 qwen。"""
+
+    def __init__(self, primary_provider: str, primary_model: Any, fallback_provider: str, fallback_model_factory, logger):
+        self.primary_provider = primary_provider
+        self.fallback_provider = fallback_provider
+        self._active_provider = primary_provider
+        self._active_model = primary_model
+        self._fallback_model = None
+        self._fallback_model_factory = fallback_model_factory
+        self._fallback_lock = threading.Lock()
+        self.logger = logger
+        self.last_provider_used = primary_provider
+
+    def invoke(self, *args, **kwargs):
+        try:
+            result = self._active_model.invoke(*args, **kwargs)
+            self.last_provider_used = self._active_provider
+            return result
+        except Exception as exc:
+            if self._active_provider == self.fallback_provider or not _is_qwen_fallback_error(exc):
+                raise
+
+            fallback_model = self._ensure_fallback_model()
+            self.logger.warning(
+                "LLM provider=%s 调用失败，自动切换到 %s。错误: %s",
+                self.primary_provider,
+                self.fallback_provider,
+                exc,
+            )
+            result = fallback_model.invoke(*args, **kwargs)
+            self.last_provider_used = self.fallback_provider
+            return result
+
+    async def ainvoke(self, *args, **kwargs):
+        try:
+            result = await self._active_model.ainvoke(*args, **kwargs)
+            self.last_provider_used = self._active_provider
+            return result
+        except Exception as exc:
+            if self._active_provider == self.fallback_provider or not _is_qwen_fallback_error(exc):
+                raise
+
+            fallback_model = self._ensure_fallback_model()
+            self.logger.warning(
+                "LLM provider=%s 异步调用失败，自动切换到 %s。错误: %s",
+                self.primary_provider,
+                self.fallback_provider,
+                exc,
+            )
+            result = await fallback_model.ainvoke(*args, **kwargs)
+            self.last_provider_used = self.fallback_provider
+            return result
+
+    def _ensure_fallback_model(self):
+        with self._fallback_lock:
+            if self._fallback_model is None:
+                self._fallback_model = self._fallback_model_factory()
+            self._active_model = self._fallback_model
+            self._active_provider = self.fallback_provider
+            return self._fallback_model
+
+    def __getattr__(self, item):
+        return getattr(self._active_model, item)
+
 class LLMServiceFactory:
     """大模型服务工厂"""
+
+    @staticmethod
+    def _build_provider_model(provider: str, merged_config: Dict[str, Any]) -> BaseChatModel:
+        if provider.lower() == "deepseek":
+            return DeepSeekChatModel(**merged_config)
+        elif provider.lower() == "qwen":
+            return QwenChatModel(**merged_config)
+        elif provider.lower() == "kimi":
+            return KimiChatModel(**merged_config)
+        elif provider.lower() == "openai":
+            from langchain_community.chat_models import ChatOpenAI
+            return ChatOpenAI(**merged_config)
+        raise NotImplementedError(f"LLM provider {provider} is not implemented")
     
     @staticmethod
     def create(provider: str, **config) -> BaseChatModel:
@@ -98,7 +196,7 @@ class LLMServiceFactory:
             provider = default_provider
         
         # 获取提供商配置
-        provider_config = providers.get(provider, {})
+        provider_config = dict(providers.get(provider, {}))
         
         # 获取API密钥
         api_key = config.get('api_key') or os.getenv(f"{provider.upper()}_API_KEY")
@@ -116,16 +214,22 @@ class LLMServiceFactory:
             'verbose': True  # 启用详细日志
         }
         
-        # 根据提供商创建相应的服务实例
-        if provider.lower() == "deepseek":
-            return DeepSeekChatModel(**merged_config)
-        elif provider.lower() == "qwen":
-            return QwenChatModel(**merged_config)
-        elif provider.lower() == "kimi":
-            return KimiChatModel(**merged_config)
-        elif provider.lower() == "openai":
-            from langchain_community.chat_models import ChatOpenAI
-            return ChatOpenAI(**merged_config)
-        else:
-            logger.error(f"未实现的LLM提供商: {provider}")
-            raise NotImplementedError(f"LLM provider {provider} is not implemented") 
+        primary_model = LLMServiceFactory._build_provider_model(provider, merged_config)
+        if provider == "qwen" or "qwen" not in providers:
+            return primary_model
+
+        def build_qwen_model():
+            fallback_config = {
+                **dict(providers.get("qwen", {})),
+                'callbacks': callbacks,
+                'verbose': True,
+            }
+            return LLMServiceFactory._build_provider_model("qwen", fallback_config)
+
+        return _FallbackChatModelProxy(
+            primary_provider=provider,
+            primary_model=primary_model,
+            fallback_provider="qwen",
+            fallback_model_factory=build_qwen_model,
+            logger=logger,
+        )

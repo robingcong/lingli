@@ -12,12 +12,30 @@ from .fetch_work_items import sync_work_items_to_db
 from .title_utils import build_test_case_title
 from apps.llm import LLMServiceFactory
 from ..agents.generator import TestCaseGeneratorAgent
+from utils.logger_manager import get_logger
+
+
+logger = get_logger(__name__)
 
 
 def _map_llm_error(exc: Exception) -> tuple[int, str]:
     """将上游LLM异常映射为更准确的HTTP状态码和提示。"""
     msg = str(exc)
     lower_msg = msg.lower()
+    if (
+        "connection error" in lower_msg
+        or "failed to establish a new connection" in lower_msg
+        or "connection aborted" in lower_msg
+        or "connection refused" in lower_msg
+        or "temporarily unavailable" in lower_msg
+    ):
+        return 503, "模型服务暂时不可用（连接失败），请稍后重试，或切换其他模型后再试。"
+    if (
+        "timeout" in lower_msg
+        or "timed out" in lower_msg
+        or "read timeout" in lower_msg
+    ):
+        return 504, "模型服务响应超时，请稍后重试，或切换其他模型后再试。"
     if (
         "502" in lower_msg
         or "bad gateway" in lower_msg
@@ -29,6 +47,20 @@ def _map_llm_error(exc: Exception) -> tuple[int, str]:
             "或切换其他模型后再试。"
         )
     return 500, f"生成失败: {msg}"
+
+
+def _map_plane_error(exc: Exception) -> tuple[int, str]:
+    """将 Plane 上游异常映射为更准确的 HTTP 状态码和提示。"""
+    msg = str(exc)
+    lower_msg = msg.lower()
+    if (
+        "502" in lower_msg
+        or "bad gateway" in lower_msg
+        or "gateway" in lower_msg
+        or "upstream" in lower_msg
+    ):
+        return 502, "Plane 服务暂时不可用（上游返回 502），请稍后重试。"
+    return 500, f"刷新 Plane 工作项失败: {msg}"
 
 
 def _ensure_plane_work_item_table() -> None:
@@ -154,12 +186,14 @@ def plane_work_items(request):
                 'failures': result['failures'][:20],
             })
         except Exception as exc:
-            return JsonResponse({'success': False, 'message': str(exc)}, status=500)
+            status, message = _map_plane_error(exc)
+            return JsonResponse({'success': False, 'message': message}, status=status)
 
     _ensure_plane_work_item_table()
     page = int(request.GET.get('page', 1))
     page_size = int(request.GET.get('page_size', 20))
     keyword = (request.GET.get('keyword') or '').strip()
+    project_id = (request.GET.get('project_id') or '').strip()
 
     qs = PlaneWorkItem.objects.all().order_by('-updated_at')
     if keyword:
@@ -169,6 +203,19 @@ def plane_work_items(request):
             | Q(work_item_name__icontains=keyword)
             | Q(work_item_content__icontains=keyword)
         )
+    if project_id:
+        qs = qs.filter(project_id=project_id)
+
+    projects = [
+        {
+            "project_id": row["project_id"],
+            "project_name": row["project_name"],
+        }
+        for row in PlaneWorkItem.objects.values("project_id", "project_name")
+        .exclude(project_id="")
+        .order_by("project_name", "project_id")
+        .distinct()
+    ]
 
     paginator = Paginator(qs, page_size)
     try:
@@ -192,6 +239,7 @@ def plane_work_items(request):
     return JsonResponse({
         'success': True,
         'items': items,
+        'projects': projects,
         'page': page_obj.number,
         'page_size': page_size,
         'total': paginator.count,
@@ -244,34 +292,55 @@ def plane_one_click_generate(request):
     default_case_design_methods = ['等价类划分', '边界值分析', '判定表', '因果图', '正交分析', '场景法']
     default_case_categories = ['功能测试', '性能测试', '兼容性测试', '安全测试']
 
-    # 上游模型网关可能出现瞬时 5xx，做一次短重试避免直接失败。
-    max_attempts = 2
     test_cases = None
+    effective_provider = llm_provider
+    provider_chain = [llm_provider]
+    if llm_provider != "qwen" and "qwen" in providers:
+        provider_chain.append("qwen")
+
     last_exc = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            # 延迟导入，避免模块加载时引入不必要的依赖链
-            from .views import knowledge_service
-            llm_service = LLMServiceFactory.create(llm_provider, **providers.get(llm_provider, {}))
-            generator_agent = TestCaseGeneratorAgent(
-                llm_service=llm_service,
-                knowledge_service=knowledge_service,
-                case_design_methods=default_case_design_methods,
-                case_categories=default_case_categories,
-                case_count=case_count,
-            )
-            test_cases = generator_agent.generate(requirements, input_type="requirement")
+    for chain_index, active_provider in enumerate(provider_chain):
+        max_attempts = 2 if chain_index == 0 else 1
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # 延迟导入，避免模块加载时引入不必要的依赖链
+                from .views import knowledge_service
+                llm_service = LLMServiceFactory.create(active_provider, **providers.get(active_provider, {}))
+                generator_agent = TestCaseGeneratorAgent(
+                    llm_service=llm_service,
+                    knowledge_service=knowledge_service,
+                    case_design_methods=default_case_design_methods,
+                    case_categories=default_case_categories,
+                    case_count=case_count,
+                )
+                test_cases = generator_agent.generate(requirements, input_type="requirement")
+                effective_provider = getattr(llm_service, "last_provider_used", active_provider) or active_provider
+                break
+            except Exception as exc:
+                last_exc = exc
+                status, _ = _map_llm_error(exc)
+                if attempt < max_attempts and status in (502, 503, 504):
+                    time.sleep(0.8)
+                    continue
+                if status in (502, 503, 504) and active_provider != "qwen" and "qwen" in providers:
+                    logger.warning(
+                        "plane_one_click_generate 模型网关失败，切换到 qwen: requested_provider=%s current_provider=%s work_item_id=%s error=%s",
+                        llm_provider,
+                        active_provider,
+                        item.work_item_id,
+                        exc,
+                    )
+                    break
+                message_status, message = _map_llm_error(exc)
+                return JsonResponse({'success': False, 'message': message}, status=message_status)
+
+        if test_cases:
             break
-        except Exception as exc:
-            last_exc = exc
-            status, _ = _map_llm_error(exc)
-            if attempt < max_attempts and status == 502:
-                time.sleep(0.8)
-                continue
-            message_status, message = _map_llm_error(exc)
-            return JsonResponse({'success': False, 'message': message}, status=message_status)
 
     if not test_cases:
+        if last_exc is not None:
+            message_status, message = _map_llm_error(last_exc)
+            return JsonResponse({'success': False, 'message': message}, status=message_status)
         return JsonResponse({'success': False, 'message': '未生成任何测试用例'}, status=500)
 
     to_create = []
@@ -286,16 +355,26 @@ def plane_one_click_generate(request):
                 test_steps='\n'.join(tc.get('test_steps', [])),
                 expected_results='\n'.join(tc.get('expected_results', [])),
                 requirements=requirements,
-                llm_provider=llm_provider,
+                llm_provider=effective_provider,
                 status='pending',
             )
         )
     created = TestCase.objects.bulk_create(to_create)
+    logger.info(
+        "plane_one_click_generate 生成并保存成功: requested_provider=%s effective_provider=%s work_item_id=%s saved_count=%s",
+        llm_provider,
+        effective_provider,
+        item.work_item_id,
+        len(created),
+    )
 
     return JsonResponse({
         'success': True,
         'message': f'已一键生成并保存 {len(created)} 条测试用例',
+        'requested_provider': llm_provider,
+        'effective_provider': effective_provider,
         'saved_count': len(created),
+        'test_cases': test_cases,
         'test_case_ids': [obj.id for obj in created],
         'plane_item': {
             'id': item.id,

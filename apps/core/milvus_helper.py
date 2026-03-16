@@ -33,7 +33,7 @@ def init_milvus_collection(collection_name=None):
         host = vector_cfg.get("host", os.getenv("MILVUS_HOST", "127.0.0.1"))
         port = vector_cfg.get("port", os.getenv("MILVUS_PORT", "19530"))
         collection_name = collection_name or vector_cfg.get(
-            "collection_name", os.getenv("MILVUS_COLLECTION", "vv_knowledge_collection")
+            "collection_name", os.getenv("MILVUS_COLLECTION", "vv_rag_markdown_chunks")
         )
 
         connections.connect(host=host, port=port)

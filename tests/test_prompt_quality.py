@@ -23,6 +23,48 @@ class PromptQualityTests(unittest.TestCase):
         self.assertIn("仅输出JSON", merged)
         self.assertIn("test_steps 与 expected_results 条数必须一致", merged)
 
+    def test_test_case_generator_requires_broad_functional_and_nonfunctional_coverage(self):
+        prompt = TestCaseGeneratorPrompt()
+        messages = prompt.format_messages(
+            requirements="用户登录",
+            case_design_methods="等价类划分法",
+            case_categories="功能测试",
+            knowledge_context="",
+            case_count=5,
+        )
+        merged = "\n".join(getattr(m, "content", str(m)) for m in messages)
+        self.assertIn("主流程", merged)
+        self.assertIn("关键分支", merged)
+        self.assertIn("边界条件", merged)
+        self.assertIn("异常处理", merged)
+        self.assertIn("性能", merged)
+        self.assertIn("兼容性", merged)
+        self.assertIn("安全", merged)
+        self.assertIn("稳定性", merged)
+        self.assertIn("至少参考目标 5 条", merged)
+        self.assertIn("覆盖不足应继续补充", merged)
+
+    def test_test_case_generator_strengthens_system_function_content_prompts(self):
+        prompt = TestCaseGeneratorPrompt()
+        messages = prompt.format_messages(
+            requirements="""
+            无人机驾驶舱支持点击指点飞行按钮，在地图上选择位置后调度无人机前往。
+            用户可在详情页查看任务状态、提示信息，并支持刷新后回显结果。
+            非管理员不可执行调度操作。
+            """,
+            case_design_methods="场景法",
+            case_categories="功能测试",
+            knowledge_context="",
+            case_count=6,
+        )
+        merged = "\n".join(getattr(m, "content", str(m)) for m in messages)
+        self.assertIn("系统功能内容专用规则", merged)
+        self.assertIn("功能子点", merged)
+        self.assertIn("页面入口", merged)
+        self.assertIn("刷新回显", merged)
+        self.assertIn("联动校验", merged)
+        self.assertIn("禁止输出空泛描述", merged)
+
     def test_reviewer_has_machine_readable_json_contract(self):
         prompt = TestCaseReviewerPrompt()
         messages = prompt.format_messages(

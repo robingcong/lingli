@@ -34,8 +34,11 @@ class _FakeLLM:
 class _FakeReviewer:
     def __init__(self, review_map):
         self.review_map = review_map
+        self.single_calls = []
+        self.batch_calls = []
 
     def review_case_data(self, test_case_data):
+        self.single_calls.append(test_case_data["description"])
         description = test_case_data["description"]
         result = self.review_map[description]
         return {
@@ -44,6 +47,24 @@ class _FakeReviewer:
             "score": result.get("score"),
             "recommendation": result.get("recommendation", ""),
         }
+
+    def review_case_batch(self, test_cases_data):
+        self.batch_calls.append([item["description"] for item in test_cases_data])
+        payloads = []
+        for item in test_cases_data:
+            description = item["description"]
+            result = self.review_map[description]
+            payloads.append({
+                "raw_text": json.dumps(result, ensure_ascii=False),
+                "parsed": result,
+                "score": result.get("score"),
+                "recommendation": result.get("recommendation", ""),
+            })
+        return payloads
+
+
+class _SingleOnlyReviewer(_FakeReviewer):
+    review_case_batch = None
 
 
 class GenerateViewQualityConfigTests(unittest.TestCase):
@@ -216,6 +237,45 @@ class GeneratorQualityGateTests(unittest.TestCase):
         self.assertNotIn("登录性能响应时间", [case["description"] for case in cases])
         self.assertIn("边界条件", llm.calls[1])
         self.assertIn("关键分支", llm.calls[1])
+        self.assertEqual(
+            reviewer.batch_calls,
+            [
+                ["登录成功主流程验证", "登录失败异常提示", "登录性能响应时间"],
+                ["登录成功主流程验证", "登录失败异常提示", "登录边界长度限制", "登录分支角色限制", "登录安全越权校验"],
+            ],
+        )
+        self.assertEqual(reviewer.single_calls, [])
+
+    def test_review_and_filter_cases_falls_back_to_single_review_when_batch_missing(self):
+        reviewer = _SingleOnlyReviewer({
+            "登录主流程": {"score": 9, "recommendation": "通过"},
+            "登录异常提示": {"score": 8, "recommendation": "通过"},
+        })
+        agent = TestCaseGeneratorAgent(
+            llm_service=SimpleNamespace(),
+            knowledge_service=self.knowledge_service,
+            case_design_methods=["等价类划分"],
+            case_categories=["功能测试"],
+            case_count=2,
+            reviewer_agent=reviewer,
+            quality_config={"min_review_score": 7},
+        )
+
+        qualified = agent._review_and_filter_cases([
+            {
+                "description": "登录主流程",
+                "test_steps": ["输入账号密码", "点击登录"],
+                "expected_results": ["登录成功", "进入首页"],
+            },
+            {
+                "description": "登录异常提示",
+                "test_steps": ["输入错误密码", "点击登录"],
+                "expected_results": ["登录失败", "提示账号或密码错误"],
+            },
+        ])
+
+        self.assertEqual(len(qualified), 2)
+        self.assertEqual(reviewer.single_calls, ["登录主流程", "登录异常提示"])
 
 
 if __name__ == "__main__":

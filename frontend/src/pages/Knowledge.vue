@@ -1,24 +1,6 @@
 ﻿<template>
   <div>
     <div class="card">
-      <h2>知识库管理</h2>
-      <div class="form-grid">
-        <div>
-          <label>标题</label>
-          <input v-model="newItem.title" />
-        </div>
-        <div>
-          <label>内容</label>
-          <textarea v-model="newItem.content"></textarea>
-        </div>
-      </div>
-      <div class="flex" style="margin-top: 12px;">
-        <button @click="add" :disabled="adding">添加</button>
-        <span v-if="message" class="notice">{{ message }}</span>
-      </div>
-    </div>
-
-    <div class="card">
       <h2>检索</h2>
       <div class="flex">
         <input v-model="query" placeholder="请输入关键字" />
@@ -28,16 +10,18 @@
         <table class="table">
           <thead>
             <tr>
-              <th>内容</th>
+              <th>命中内容</th>
               <th>相似度</th>
-              <th>来源</th>
+              <th>来源文件</th>
+              <th>Chunk ID</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="(item, idx) in searchResults" :key="idx">
               <td>{{ item.content }}</td>
-              <td>{{ item.score }}</td>
+              <td>{{ Number(item.score || 0).toFixed(4) }}</td>
               <td>{{ item.source }}</td>
+              <td>{{ item.chunk_id || '-' }}</td>
             </tr>
           </tbody>
         </table>
@@ -45,33 +29,85 @@
     </div>
 
     <div class="card">
-      <h2>全部条目</h2>
+      <div class="flex" style="justify-content: space-between; align-items: center;">
+        <h2>知识库内容</h2>
+        <span class="muted">仅展示 /docs/rag 下的知识库文档</span>
+      </div>
       <table class="table" v-if="items.length">
         <thead>
           <tr>
-            <th>编号</th>
-            <th>标题</th>
-            <th>内容</th>
-            <th>创建时间</th>
+            <th>文件名</th>
+            <th>路径</th>
+            <th>Chunk 数</th>
+            <th>更新时间</th>
+            <th>操作</th>
           </tr>
         </thead>
         <tbody>
-          <tr v-for="item in items" :key="item.id">
-            <td>{{ item.id }}</td>
+          <tr v-for="item in items" :key="item.entry_id">
             <td>{{ item.title }}</td>
-            <td>{{ item.content }}</td>
-            <td>{{ formatTime(item.created_at) }}</td>
+            <td>{{ item.source }}</td>
+            <td>{{ item.chunk_count || 0 }}</td>
+            <td>{{ formatTime(item.updated_at || item.created_at) }}</td>
+            <td>
+              <button class="secondary" @click="openDetail(item)" :disabled="detailLoading && activeEntryId === item.entry_id">
+                查看详情
+              </button>
+            </td>
           </tr>
         </tbody>
       </table>
       <div v-else class="notice">暂无知识条目。</div>
       <div v-if="error" class="notice error">{{ error }}</div>
     </div>
+
+    <div v-if="selectedItem" class="card">
+      <div class="flex" style="justify-content: space-between; align-items: center;">
+        <div>
+          <h2>{{ selectedItem.title }}</h2>
+          <div class="muted">{{ selectedItem.source }}</div>
+        </div>
+        <button class="secondary" @click="selectedItem = null">关闭</button>
+      </div>
+
+      <div v-if="detailLoading" class="notice" style="margin-top: 12px;">正在加载详情...</div>
+      <div v-else>
+        <div class="form-grid" style="margin-top: 12px;">
+          <div>
+            <label>类型</label>
+            <div>{{ selectedItem.entry_type === 'rag_file' ? 'RAG 文档' : selectedItem.entry_type }}</div>
+          </div>
+          <div>
+            <label>Chunk 数</label>
+            <div>{{ selectedItem.chunk_count || 0 }}</div>
+          </div>
+        </div>
+
+        <div style="margin-top: 16px;">
+          <label>全文内容</label>
+          <pre class="text-block">{{ selectedItem.full_content || selectedItem.content || '暂无内容' }}</pre>
+        </div>
+
+        <div style="margin-top: 16px;">
+          <label>Chunk 明细</label>
+          <div v-if="selectedItem.chunks?.length">
+            <details v-for="chunk in selectedItem.chunks" :key="chunk.chunk_id" class="chunk-item">
+              <summary>
+                <span>{{ chunk.chunk_id }}</span>
+                <span class="muted">{{ chunk.upload_time ? formatTime(chunk.upload_time) : '' }}</span>
+              </summary>
+              <pre class="text-block">{{ chunk.content }}</pre>
+            </details>
+          </div>
+          <div v-else class="notice">暂无 chunk 明细。</div>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup>
-import { onMounted, reactive, ref } from 'vue';
+import { onMounted, ref } from 'vue';
 import { api } from '../api/endpoints';
 
 const items = ref([]);
@@ -79,42 +115,19 @@ const searchResults = ref([]);
 const query = ref('');
 const message = ref('');
 const error = ref('');
-const adding = ref(false);
 const searching = ref(false);
-
-const newItem = reactive({
-  title: '',
-  content: ''
-});
+const selectedItem = ref(null);
+const detailLoading = ref(false);
+const activeEntryId = ref('');
 
 const formatTime = (value) => (value ? new Date(value).toLocaleString() : '');
 
 async function load() {
   try {
-    const data = await api.listKnowledge();
-    items.value = data.knowledge_items || [];
+    const data = await api.listKnowledgeLibrary();
+    items.value = data.items || [];
   } catch (e) {
     error.value = e.message || '加载失败。';
-  }
-}
-
-async function add() {
-  if (!newItem.title.trim() || !newItem.content.trim()) {
-    message.value = '标题和内容不能为空。';
-    return;
-  }
-  adding.value = true;
-  message.value = '';
-  try {
-    const data = await api.addKnowledge({ title: newItem.title, content: newItem.content });
-    message.value = data.message || '添加成功。';
-    newItem.title = '';
-    newItem.content = '';
-    await load();
-  } catch (e) {
-    message.value = e.message || '添加失败。';
-  } finally {
-    adding.value = false;
   }
 }
 
@@ -131,5 +144,49 @@ async function search() {
   }
 }
 
+async function openDetail(item) {
+  detailLoading.value = true;
+  activeEntryId.value = item.entry_id;
+  try {
+    const data = await api.getKnowledgeLibraryDetail(item.entry_id);
+    selectedItem.value = data.item || item;
+  } catch (e) {
+    error.value = e.message || '加载详情失败。';
+  } finally {
+    detailLoading.value = false;
+  }
+}
+
 onMounted(load);
 </script>
+
+<style scoped>
+.muted {
+  color: var(--muted-color, #666);
+  font-size: 12px;
+}
+
+.text-block {
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: rgba(0, 0, 0, 0.03);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.chunk-item {
+  margin-top: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+.chunk-item summary {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  cursor: pointer;
+}
+</style>

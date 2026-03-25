@@ -1,15 +1,16 @@
 ﻿# 灵例 (LingLi)
 
-一个基于大模型的智能测试用例生成与评审平台，支持知识库管理与向量检索。：
+一个基于大模型的智能测试用例生成与评审平台，支持知识库管理、向量检索与结构化 RAG 上下文注入。
 - 前端：Vue 3 + Vite (SPA)
 - 后端：Django (RESTful API)
+- RAG / Prompt 编排：Milvus + BGE-M3 + LangChain Prompt / Message 组件
 
 ## 主要功能
 
 - 多模型支持：DeepSeek / 通义千问等
-- 用例生成：基于需求描述生成测试用例
-- 用例评审：AI 辅助评审与状态管理
-- 知识库管理：文档导入、向量化存储与语义检索
+- 用例生成：基于需求描述生成测试用例，并结合知识库证据增强生成质量
+- 用例评审：AI 辅助评审与状态管理，支持批量评审加速生成链路
+- 知识库管理：文档导入、向量化存储、混合检索与结构化 RAG 上下文构建
 - 接口用例生成：上传 API 定义 JSON 自动生成用例
 - 主题切换：前端支持主题配色切换
 
@@ -19,7 +20,6 @@
 project/
 ├─ apps/                 # Django 应用
 ├─ config/               # Django 配置
-C
 ├─ utils/                # 工具
 ├─ frontend/             # Vue 3 + Vite 前端
 │  ├─ src/
@@ -38,16 +38,23 @@ py -3.12 -m venv .venv
 .venv\Scripts\activate
 python -m pip install -U pip setuptools wheel
 pip install -r requirements.txt
-```
-'初始化数据库'
 python manage.py migrate
+```
 
-
-`settings.py/每个模型.py` 中配置密钥（示例）：
+在环境变量或 `settings.py` 对应配置中设置模型密钥（示例）：
 
 ```plaintext
 DEEPSEEK_API_KEY=""
 QWEN_API_KEY=""
+```
+
+Milvus 连接配置（示例）：
+
+```plaintext
+ENABLE_MILVUS=true
+MILVUS_HOST=127.0.0.1
+MILVUS_PORT=19530
+MILVUS_COLLECTION=vv_rag_markdown_chunks
 ```
 
 启动后端：
@@ -79,6 +86,26 @@ npm run dev
   - 用例类型：功能 / 性能 / 兼容性 / 安全
 - 前端默认模型：**通义千问**（若可用）
 
+## RAG 与评审机制
+
+- 知识库文档上传后会切分为多个 chunk，生成 embedding，并写入 Milvus 集合 `vv_rag_markdown_chunks`
+- 检索阶段采用“向量召回 + BM25 混合重排”
+- 检索命中的 chunk 不再直接裸拼 prompt，而是会经过去重、限长、引用编号等处理，组装成结构化 RAG 上下文
+- 测试用例生成时会把这些证据块注入 prompt，优先吸收业务术语、状态流转、约束规则、边界条件与异常处理
+- 用例质量评审已改为“批量评审优先，单条评审回退”，能显著减少生成过程中的大模型调用次数
+
+当前生成链路可以简化理解为：
+
+```text
+需求输入
+  -> 知识库检索
+  -> 混合重排
+  -> 上下文压缩 / 引用构建
+  -> 用例生成
+  -> 批量 AI 评审
+  -> 结果去重与筛选
+```
+
 ## 主题切换
 
 左侧导航处提供主题切换按钮，可在默认/海洋/暖阳三种主题中切换。
@@ -101,5 +128,4 @@ npm run dev
 如果出现：
 
 `Microsoft Visual C++ 14.0 or greater is required`
-
 

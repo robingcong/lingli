@@ -8,6 +8,7 @@ from .models import (
     TestCase,
     TestCaseReview,
     KnowledgeBase,
+    KnowledgeDocument,
     TestCaseAIReview,
     PRDAnalysis,
     ApiSchemaFile,
@@ -27,6 +28,7 @@ from django.conf import settings
 from apps.llm import LLMServiceFactory
 from ..knowledge.vector_store import MilvusVectorStore
 from ..knowledge.embedding import BGEM3Embedder
+from ..knowledge.rag_sync import RagKnowledgeSyncService
 from utils.logger_manager import get_logger, set_task_context, clear_task_context
 
 from django.http import JsonResponse
@@ -64,6 +66,32 @@ FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://127.0.0.1:5173").rstr
 def _redirect_to_frontend(path: str):
     route = path if path.startswith("/") else f"/{path}"
     return redirect(f"{FRONTEND_BASE_URL}{route}")
+
+
+def _list_rag_files():
+    rag_root = os.path.join(settings.BASE_DIR, 'docs', 'rag')
+    rag_files = []
+    if not os.path.isdir(rag_root):
+        return rag_files
+    for root, _, files in os.walk(rag_root):
+        for file_name in files:
+            abs_path = os.path.join(root, file_name)
+            rel_path = os.path.relpath(abs_path, settings.BASE_DIR)
+            rag_files.append(rel_path.replace("\\", "/"))
+    return sorted(rag_files)
+
+
+def _sync_rag_documents_if_needed():
+    if 'vector_store' not in globals() or 'embedder' not in globals():
+        return
+    try:
+        RagKnowledgeSyncService(
+            base_dir=str(settings.BASE_DIR),
+            vector_store=vector_store,
+            embedder=embedder,
+        ).sync()
+    except Exception as exc:
+        logger.warning("RAG 文档自动同步失败，回退到旧逻辑: %s", exc)
 
 class _FallbackKnowledgeService:
     """Milvus不可用时的降级服务，避免应用启动失败。"""
@@ -430,6 +458,139 @@ def knowledge_list(request):
             'success': True,
             'knowledge_items': items
         })
+    except Exception as e:
+        return JsonResponse({
+            'success': False,
+            'message': str(e)
+        })
+
+
+def _build_rag_knowledge_items():
+    _sync_rag_documents_if_needed()
+    try:
+        documents = list(KnowledgeDocument.objects.all().order_by('-updated_at'))
+    except Exception:
+        documents = []
+    if documents:
+        return [
+            {
+                'entry_id': f'rag:{doc.source_path}',
+                'entry_type': 'rag_file',
+                'title': doc.title,
+                'source': doc.source_path,
+                'summary': doc.content[:160],
+                'chunk_count': doc.chunk_count,
+                'doc_type': doc.doc_type,
+                'created_at': doc.created_at.isoformat(),
+                'updated_at': doc.updated_at.isoformat(),
+            }
+            for doc in documents
+        ]
+
+    rag_files = _list_rag_files()
+    items = []
+    for source in rag_files:
+        chunks = vector_store.get_document_chunks(source) if 'vector_store' in globals() else []
+        latest_upload_time = max((str(chunk.get('upload_time') or '') for chunk in chunks), default='')
+        content_preview = ''
+        if chunks:
+            content_preview = str(chunks[0].get('content') or '')
+        items.append({
+            'entry_id': f'rag:{source}',
+            'entry_type': 'rag_file',
+            'title': os.path.basename(source),
+            'source': source,
+            'summary': content_preview[:160],
+            'chunk_count': len(chunks),
+            'doc_type': chunks[0].get('doc_type') if chunks else os.path.splitext(source)[1],
+            'created_at': latest_upload_time,
+            'updated_at': latest_upload_time,
+        })
+    return items
+
+
+@require_http_methods(["GET"])
+def knowledge_library_list(request):
+    """知识库浏览列表：仅展示 docs/rag 下的文档。"""
+    try:
+        items = _build_rag_knowledge_items()
+        items.sort(key=lambda item: item.get('updated_at') or item.get('created_at') or '', reverse=True)
+        return JsonResponse({
+            'success': True,
+            'items': items,
+        })
+    except Exception as e:
+        return JsonResponse({
+            'success': False,
+            'message': str(e)
+        })
+
+
+@require_http_methods(["GET"])
+def knowledge_library_detail(request):
+    """知识库详情：返回全文与 chunk 明细。"""
+    try:
+        entry_id = request.GET.get('entry_id', '')
+        if not entry_id:
+            return JsonResponse({'success': False, 'message': 'entry_id 不能为空'})
+
+        if entry_id.startswith('rag:'):
+            _sync_rag_documents_if_needed()
+            source = entry_id.split(':', 1)[1]
+            document = KnowledgeDocument.objects.filter(source_path=source).prefetch_related('chunks').first()
+            if document:
+                chunks = [
+                    {
+                        'chunk_id': chunk.chunk_id,
+                        'content': chunk.content,
+                        'source': source,
+                        'doc_type': document.doc_type,
+                        'upload_time': document.updated_at.isoformat(),
+                    }
+                    for chunk in document.chunks.all().order_by('chunk_index')
+                ]
+                return JsonResponse({
+                    'success': True,
+                    'item': {
+                        'entry_id': entry_id,
+                        'entry_type': 'rag_file',
+                        'title': document.title,
+                        'source': document.source_path,
+                        'summary': document.content[:160],
+                        'full_content': document.content,
+                        'chunk_count': document.chunk_count,
+                        'doc_type': document.doc_type,
+                        'created_at': document.created_at.isoformat(),
+                        'updated_at': document.updated_at.isoformat(),
+                        'chunks': chunks,
+                    }
+                })
+
+            abs_path = os.path.join(settings.BASE_DIR, source)
+            if not os.path.isfile(abs_path):
+                return JsonResponse({'success': False, 'message': '未找到对应知识库文件'}, status=404)
+            with open(abs_path, 'r', encoding='utf-8') as fh:
+                full_content = fh.read()
+            chunks = vector_store.get_document_chunks(source) if 'vector_store' in globals() else []
+            latest_upload_time = max((str(chunk.get('upload_time') or '') for chunk in chunks), default='')
+            return JsonResponse({
+                'success': True,
+                'item': {
+                    'entry_id': entry_id,
+                    'entry_type': 'rag_file',
+                    'title': os.path.basename(source),
+                    'source': source,
+                    'summary': full_content[:160],
+                    'full_content': full_content,
+                    'chunk_count': len(chunks),
+                    'doc_type': os.path.splitext(source)[1],
+                    'created_at': latest_upload_time,
+                    'updated_at': latest_upload_time,
+                    'chunks': chunks,
+                }
+            })
+
+        return JsonResponse({'success': False, 'message': '不支持的 entry_id'}, status=400)
     except Exception as e:
         return JsonResponse({
             'success': False,

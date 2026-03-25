@@ -7,6 +7,8 @@ from langchain.prompts import ChatPromptTemplate
 from langchain.prompts.chat import SystemMessagePromptTemplate, HumanMessagePromptTemplate
 from langchain_core.messages import HumanMessage
 
+from apps.knowledge.schemas import RAGContextResult
+
 class PromptTemplateManager:
     """提示词模板管理器"""
     
@@ -180,7 +182,7 @@ class TestCaseGeneratorPrompt:
         requirements: str,
         case_design_methods: str = "",
         case_categories: str = "",
-        knowledge_context: str = "",
+        knowledge_context: str | RAGContextResult = "",
         case_count: int = 10,
         missing_coverage_tags: Optional[List[str]] = None,
         existing_case_summaries: Optional[List[str]] = None,
@@ -204,12 +206,7 @@ class TestCaseGeneratorPrompt:
         if not case_categories:
             case_categories = "所有适用的测试类型"
             
-        # 格式化知识上下文提示
-        knowledge_prompt = (
-            f"参考以下知识库内容：\n{knowledge_context}"
-            if knowledge_context
-            else "根据你的专业知识"
-        )
+        knowledge_prompt = self._format_knowledge_prompt(knowledge_context)
         quantity_instruction = (
             "，数量不设上限，请尽可能多生成 case，并持续补齐所有覆盖维度"
             if case_count <= 0
@@ -253,6 +250,25 @@ class TestCaseGeneratorPrompt:
             )
         return messages
 
+    def _format_knowledge_prompt(self, knowledge_context: str | RAGContextResult) -> str:
+        if isinstance(knowledge_context, RAGContextResult):
+            if not knowledge_context.context_text:
+                return "根据你的专业知识"
+            return "\n".join(
+                [
+                    "以下是与当前需求相关的知识库证据，请优先参考高相关证据进行测试设计：",
+                    "若知识库证据与用户需求冲突，以用户需求为准。",
+                    "若知识库证据不足，不要编造知识库中不存在的规则，可补充通用测试专业知识。",
+                    "请重点吸收证据中的业务术语、状态流转、校验规则、边界条件和异常处理。",
+                    "",
+                    knowledge_context.context_text,
+                ]
+            )
+
+        if knowledge_context:
+            return f"参考以下知识库内容：\n{knowledge_context}"
+        return "根据你的专业知识"
+
 class TestCaseReviewerPrompt:
     """测试用例评审提示词"""
     
@@ -286,6 +302,41 @@ class TestCaseReviewerPrompt:
             test_case=test_case_str,
             review_points=review_points
         )
+
+    def format_batch_messages(self, test_cases: List[Dict[str, Any]]) -> list:
+        """格式化批量评审消息。"""
+        review_points = '\n'.join(
+            f"- {point}"
+            for point in self.prompt_manager.config['test_case_reviewer']['review_points']
+        )
+        cases_payload = []
+        for index, test_case in enumerate(test_cases, start=1):
+            cases_payload.append(
+                {
+                    "index": index,
+                    "description": test_case.get("description", ""),
+                    "test_steps": test_case.get("test_steps", []),
+                    "expected_results": test_case.get("expected_results", []),
+                }
+            )
+
+        batch_case_str = json.dumps(cases_payload, ensure_ascii=False, indent=2)
+        messages = self.prompt_template.format_messages(
+            test_case=batch_case_str,
+            review_points=review_points,
+        )
+        messages.append(
+            HumanMessage(
+                content="\n".join(
+                    [
+                        "请一次性评审上面所有测试用例，并按输入顺序返回等长 JSON 数组。",
+                        "数组中的每个元素对应一个测试用例，必须包含字段：score、strengths、weaknesses、suggestions、missing_scenarios、recommendation、comments。",
+                        "禁止输出 JSON 数组之外的任何解释性文本。",
+                    ]
+                )
+            )
+        )
+        return messages
 
 class PrdAnalyserPrompt:
     """PRD分析提示词"""

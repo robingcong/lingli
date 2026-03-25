@@ -16,6 +16,9 @@ export const api = {
   deleteTestCases: (ids) => apiDelete(`/api/delete-test-cases/?ids=${encodeURIComponent(ids.join(','))}`),
 
   listKnowledge: () => apiGet('/api/knowledge-list/'),
+  listKnowledgeLibrary: () => apiGet('/api/knowledge-library/'),
+  getKnowledgeLibraryDetail: (entryId) =>
+    apiGet(`/api/knowledge-library/detail/?entry_id=${encodeURIComponent(entryId)}`),
   addKnowledge: (payload) => apiPostJson('/api/add-knowledge/', payload),
   searchKnowledge: (payload) => apiPostJson('/api/search-knowledge/', payload),
 

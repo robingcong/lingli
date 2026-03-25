@@ -2,6 +2,7 @@ from pymilvus import connections, Collection, utility, DataType
 from pymilvus import CollectionSchema, FieldSchema
 from typing import List, Dict, Any
 import os
+from collections import defaultdict
 from django.conf import settings
 from utils.logger_manager import get_logger
 
@@ -147,3 +148,67 @@ class MilvusVectorStore:
 
         collection.release()
         return ret
+
+    def list_grouped_documents(self) -> List[Dict[str, Any]]:
+        """按 source 聚合已入库的文档块，便于知识库浏览。"""
+        rows = self._query_rows()
+        grouped: Dict[str, Dict[str, Any]] = defaultdict(
+            lambda: {
+                "source": "",
+                "doc_type": "",
+                "chunk_count": 0,
+                "content_preview": "",
+                "upload_time": "",
+            }
+        )
+        for row in rows:
+            source = row.get("source") or ""
+            if not source:
+                continue
+            entry = grouped[source]
+            entry["source"] = source
+            entry["doc_type"] = row.get("doc_type") or entry["doc_type"]
+            entry["chunk_count"] += 1
+            if not entry["content_preview"]:
+                entry["content_preview"] = str(row.get("content") or "")
+            upload_time = row.get("upload_time") or ""
+            if upload_time and upload_time > entry["upload_time"]:
+                entry["upload_time"] = upload_time
+        documents = list(grouped.values())
+        documents.sort(key=lambda item: item.get("upload_time") or "", reverse=True)
+        return documents
+
+    def get_document_chunks(self, source: str) -> List[Dict[str, Any]]:
+        """获取指定 source 对应的全部 chunk。"""
+        rows = self._query_rows(source=source)
+        rows.sort(key=lambda item: item.get("chunk_id") or "")
+        return rows
+
+    def delete_by_source(self, source: str) -> None:
+        collection = Collection(self.collection_name)
+        collection.load()
+        collection.delete(expr=self._build_source_expr(source))
+        collection.flush()
+        collection.release()
+
+    def _query_rows(self, source: str | None = None) -> List[Dict[str, Any]]:
+        collection = Collection(self.collection_name)
+        collection.load()
+        scalar_fields = [
+            field.name for field in collection.schema.fields if field.dtype != DataType.FLOAT_VECTOR
+        ]
+        output_fields = [
+            name
+            for name in ["content", "metadata", "source", "doc_type", "chunk_id", "upload_time"]
+            if name in scalar_fields
+        ]
+        expr = "id >= 0"
+        if source and "source" in scalar_fields:
+            expr = self._build_source_expr(source)
+        rows = collection.query(expr=expr, output_fields=output_fields, limit=16384)
+        collection.release()
+        return rows
+
+    def _build_source_expr(self, source: str) -> str:
+        safe_source = str(source).replace("\\", "\\\\").replace("'", "\\'")
+        return f"source == '{safe_source}'"

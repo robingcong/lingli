@@ -1,4 +1,4 @@
-from typing import Dict, Any, List, Optional, Set
+from typing import Dict, Any, List, Optional, Set, Union
 import json
 import re
 from difflib import SequenceMatcher
@@ -7,6 +7,7 @@ from django.conf import settings
 
 from ..llm.base import BaseLLMService
 from ..knowledge.service import KnowledgeService
+from ..knowledge.schemas import RAGContextResult
 from .prompts import TestCaseGeneratorPrompt
 from .reviewer import TestCaseReviewerAgent
 from utils.logger_manager import get_logger
@@ -56,7 +57,12 @@ class TestCaseGeneratorAgent:
         """生成测试用例"""
         self.logger.info("开始生成测试用例,进入生成测试用例的TestCaseGeneratorAgent")
         knowledge_context = self._get_knowledge_context(input_text)
-        self.logger.info(f"获取到知识库上下文: \n{'='*50}\n{knowledge_context}\n{'='*50}")
+        knowledge_preview = (
+            knowledge_context.context_text
+            if isinstance(knowledge_context, RAGContextResult)
+            else str(knowledge_context or "")
+        )
+        self.logger.info(f"获取到知识库上下文: \n{'='*50}\n{knowledge_preview}\n{'='*50}")
 
         effective_target_count = self._get_effective_target_count()
         retained_cases: List[Dict[str, Any]] = []
@@ -113,7 +119,7 @@ class TestCaseGeneratorAgent:
     def _generate_candidate_cases(
         self,
         input_text: str,
-        knowledge_context: str,
+        knowledge_context: Union[str, RAGContextResult],
         request_count: int,
         missing_coverages: List[str],
         existing_case_summaries: List[str],
@@ -147,12 +153,15 @@ class TestCaseGeneratorAgent:
         except Exception as e:
             raise ValueError(f"无法解析生成的测试用例: {str(e)}\n原始响应: {result}")
 
-    def _get_knowledge_context(self, input_text: str) -> str:
+    def _get_knowledge_context(self, input_text: str) -> Union[str, RAGContextResult]:
         """获取相关知识上下文"""
         try:
-            knowledge = self.knowledge_service.search_relevant_knowledge(input_text)
+            if hasattr(self.knowledge_service, "search_relevant_knowledge_context"):
+                knowledge = self.knowledge_service.search_relevant_knowledge_context(input_text)
+            else:
+                knowledge = self.knowledge_service.search_relevant_knowledge(input_text)
             if knowledge:
-                return f"{knowledge}"
+                return knowledge
         except Exception as e:
             self.logger.warning(f"获取知识上下文失败: {str(e)}")
         return ""
@@ -281,8 +290,8 @@ class TestCaseGeneratorAgent:
     def _review_and_filter_cases(self, test_cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         qualified_cases = []
         min_review_score = int(self.quality_config.get("min_review_score", 7))
-        for case in test_cases:
-            review_payload = self.reviewer_agent.review_case_data(case)
+        review_payloads = self._review_cases_batch(test_cases)
+        for case, review_payload in zip(test_cases, review_payloads):
             score = int(review_payload.get("score") or 0)
             recommendation = str(review_payload.get("recommendation") or "")
             next_case = dict(case)
@@ -293,6 +302,19 @@ class TestCaseGeneratorAgent:
             if score >= min_review_score and recommendation != "不通过":
                 qualified_cases.append(next_case)
         return qualified_cases
+
+    def _review_cases_batch(self, test_cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not test_cases:
+            return []
+
+        batch_review = getattr(self.reviewer_agent, "review_case_batch", None)
+        if callable(batch_review):
+            try:
+                return batch_review(test_cases)
+            except Exception as exc:
+                self.logger.warning("批量评审失败，回退到逐条评审: %s", exc)
+
+        return [self.reviewer_agent.review_case_data(case) for case in test_cases]
 
     def _required_coverages_for_target(self, target_count: int) -> List[str]:
         required = ["主流程", "关键分支", "边界条件", "异常处理"]

@@ -138,6 +138,54 @@ class KnowledgeBase(models.Model):
         verbose_name_plural = "知识库"
 
 
+class KnowledgeDocument(models.Model):
+    """RAG 文档主表。"""
+
+    source_path = models.CharField(max_length=500, unique=True, verbose_name="文档路径")
+    title = models.CharField(max_length=255, verbose_name="标题")
+    doc_type = models.CharField(max_length=32, blank=True, verbose_name="文档类型")
+    content = models.TextField(verbose_name="全文内容")
+    content_hash = models.CharField(max_length=64, db_index=True, verbose_name="内容哈希")
+    file_mtime = models.FloatField(default=0, verbose_name="文件修改时间")
+    chunk_count = models.IntegerField(default=0, verbose_name="Chunk 数量")
+    status = models.CharField(max_length=32, default="indexed", verbose_name="同步状态")
+    last_indexed_at = models.DateTimeField(null=True, blank=True, verbose_name="最近索引时间")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
+
+    def __str__(self):
+        return self.title
+
+    class Meta:
+        db_table = "knowledge_document"
+        verbose_name = "知识文档"
+        verbose_name_plural = "知识文档"
+
+
+class KnowledgeChunk(models.Model):
+    """RAG chunk 明细表。"""
+
+    document = models.ForeignKey(
+        KnowledgeDocument,
+        on_delete=models.CASCADE,
+        related_name="chunks",
+        verbose_name="所属文档",
+    )
+    chunk_id = models.CharField(max_length=128, unique=True, verbose_name="Chunk ID")
+    chunk_index = models.IntegerField(default=0, verbose_name="Chunk 顺序")
+    content = models.TextField(verbose_name="Chunk 内容")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
+
+    def __str__(self):
+        return self.chunk_id
+
+    class Meta:
+        db_table = "knowledge_chunk"
+        verbose_name = "知识分块"
+        verbose_name_plural = "知识分块"
+
+
 class PRDAnalysis(models.Model):
     """PRD 分析记录"""
 

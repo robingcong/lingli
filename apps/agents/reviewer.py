@@ -1,4 +1,4 @@
-from typing import Dict, Any
+from typing import Dict, Any, List
 import json
 
 from ..llm.base import BaseLLMService
@@ -52,6 +52,43 @@ class TestCaseReviewerAgent:
             self.logger.error("评审过程出错: %s", str(e), exc_info=True)
             raise Exception(f"评审失败: {str(e)}")
 
+    def review_case_batch(self, test_cases_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """批量评审测试用例并返回与输入等长的结构化结果列表。"""
+        if not test_cases_data:
+            return []
+
+        try:
+            self.logger.info("待批量评审的测试用例数量: %s", len(test_cases_data))
+            messages = self.prompt.format_batch_messages(test_cases_data)
+            self.logger.info("构建后的批量评审提示词: \n%s", messages)
+
+            result = self.llm_service.invoke(messages)
+            raw_text = result.content if hasattr(result, "content") else str(result)
+            cleaned = self._extract_json(raw_text)
+            if cleaned != raw_text:
+                self.logger.info("批量评审结果已截取为JSON片段")
+
+            parsed_items = self._parse_review_json_array(cleaned)
+            if len(parsed_items) != len(test_cases_data):
+                raise ValueError(
+                    f"批量评审结果数量不匹配: expected={len(test_cases_data)}, actual={len(parsed_items)}"
+                )
+
+            payloads: List[Dict[str, Any]] = []
+            for item in parsed_items:
+                payloads.append(
+                    {
+                        "raw_text": json.dumps(item, ensure_ascii=False),
+                        "parsed": item,
+                        "score": item.get("score"),
+                        "recommendation": item.get("recommendation", ""),
+                    }
+                )
+            return payloads
+        except Exception as e:
+            self.logger.error("批量评审过程出错: %s", str(e), exc_info=True)
+            raise Exception(f"批量评审失败: {str(e)}")
+
     def _parse_review_json(self, text: str) -> Dict[str, Any]:
         try:
             parsed = json.loads(text)
@@ -77,14 +114,38 @@ class TestCaseReviewerAgent:
             if len(parts) >= 2:
                 content = parts[1].replace("json", "").strip()
 
-        start_obj = content.find("{")
-        end_obj = content.rfind("}")
-        if start_obj != -1 and end_obj != -1 and end_obj > start_obj:
-            return content[start_obj:end_obj + 1].strip()
+        if content.startswith("["):
+            end_arr = content.rfind("]")
+            if end_arr != -1:
+                return content[: end_arr + 1].strip()
+
+        if content.startswith("{"):
+            end_obj = content.rfind("}")
+            if end_obj != -1:
+                return content[: end_obj + 1].strip()
 
         start_arr = content.find("[")
         end_arr = content.rfind("]")
-        if start_arr != -1 and end_arr != -1 and end_arr > start_arr:
+        start_obj = content.find("{")
+        end_obj = content.rfind("}")
+        if start_arr != -1 and end_arr != -1 and (start_obj == -1 or start_arr < start_obj):
             return content[start_arr:end_arr + 1].strip()
+        if start_obj != -1 and end_obj != -1:
+            return content[start_obj:end_obj + 1].strip()
 
         return content
+
+    def _parse_review_json_array(self, text: str) -> List[Dict[str, Any]]:
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                normalized = []
+                for item in parsed:
+                    if isinstance(item, dict):
+                        normalized.append(item)
+                    else:
+                        normalized.append(self._parse_review_json(str(item)))
+                return normalized
+        except Exception:
+            pass
+        return []

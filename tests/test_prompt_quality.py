@@ -6,6 +6,7 @@ from apps.agents.prompts import (
     PrdAnalyserPrompt,
     APITestCaseGeneratorPrompt,
 )
+from apps.knowledge.schemas import RAGContextResult, RetrievedChunk
 
 
 class PromptQualityTests(unittest.TestCase):
@@ -64,6 +65,40 @@ class PromptQualityTests(unittest.TestCase):
         self.assertIn("刷新回显", merged)
         self.assertIn("联动校验", merged)
         self.assertIn("禁止输出空泛描述", merged)
+
+    def test_test_case_generator_formats_structured_rag_context_with_citations(self):
+        prompt = TestCaseGeneratorPrompt()
+        knowledge_context = RAGContextResult(
+            query="设备列表",
+            chunks=[
+                RetrievedChunk(
+                    content="设备列表展示设备名称、状态、电量。",
+                    source="uploads/device.md",
+                    chunk_id="device_0001",
+                    doc_type=".md",
+                    vector_score=0.91,
+                    bm25_score=0.87,
+                    hybrid_score=0.90,
+                    citation_id="KB#1",
+                )
+            ],
+            context_text="[KB#1]\nsource: uploads/device.md\nchunk_id: device_0001\nscore: 0.900\ncontent:\n设备列表展示设备名称、状态、电量。",
+            citations=[{"citation_id": "KB#1", "source": "uploads/device.md", "chunk_id": "device_0001"}],
+            used_chunk_count=1,
+            dropped_chunk_count=0,
+        )
+        messages = prompt.format_messages(
+            requirements="设备列表页面",
+            case_design_methods="场景法",
+            case_categories="功能测试",
+            knowledge_context=knowledge_context,
+            case_count=3,
+        )
+        merged = "\n".join(getattr(m, "content", str(m)) for m in messages)
+        self.assertIn("以下是与当前需求相关的知识库证据", merged)
+        self.assertIn("[KB#1]", merged)
+        self.assertIn("source: uploads/device.md", merged)
+        self.assertIn("若知识库证据与用户需求冲突，以用户需求为准", merged)
 
     def test_reviewer_has_machine_readable_json_contract(self):
         prompt = TestCaseReviewerPrompt()

@@ -12,7 +12,7 @@ django.setup()
 from django.test import RequestFactory
 
 from apps.core import views
-from apps.core.models import KnowledgeChunk, KnowledgeDocument
+from apps.core.models import KnowledgeBase, KnowledgeChunk, KnowledgeDocument
 
 
 class _FakeVectorStore:
@@ -30,12 +30,46 @@ class _FakeVectorStore:
 class KnowledgeLibraryApiTests(unittest.TestCase):
     def setUp(self):
         self.factory = RequestFactory()
+        KnowledgeBase.objects.all().delete()
         KnowledgeChunk.objects.all().delete()
         KnowledgeDocument.objects.all().delete()
 
     def tearDown(self):
+        KnowledgeBase.objects.all().delete()
         KnowledgeChunk.objects.all().delete()
         KnowledgeDocument.objects.all().delete()
+
+    def test_knowledge_list_returns_manual_entries_with_preview_and_updated_at(self):
+        KnowledgeBase.objects.create(
+            title="手动规则",
+            content="集群任务规划需要校验多架异构无人机的任务分配和状态回显。",
+        )
+
+        request = self.factory.get("/api/knowledge-list/")
+        response = views.knowledge_list(request)
+
+        payload = json.loads(response.content)
+        self.assertTrue(payload["success"])
+        self.assertEqual(len(payload["knowledge_items"]), 1)
+        item = payload["knowledge_items"][0]
+        self.assertEqual(item["entry_type"], "manual")
+        self.assertEqual(item["title"], "手动规则")
+        self.assertIn("多架异构无人机", item["summary"])
+        self.assertIn("updated_at", item)
+
+    def test_add_knowledge_rejects_blank_manual_content(self):
+        request = self.factory.post(
+            "/api/add-knowledge/",
+            data=json.dumps({"title": "  ", "content": "  "}),
+            content_type="application/json",
+        )
+
+        response = views.add_knowledge(request)
+
+        payload = json.loads(response.content)
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(payload["success"])
+        self.assertEqual(KnowledgeBase.objects.count(), 0)
 
     def test_knowledge_library_list_only_includes_docs_rag_files(self):
         request = self.factory.get("/api/knowledge-library/")

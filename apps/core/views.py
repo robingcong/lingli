@@ -34,9 +34,9 @@ from utils.logger_manager import get_logger, set_task_context, clear_task_contex
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 import os
+import threading
 from datetime import datetime
 import time
-from .milvus_helper import get_embedding_model, init_milvus_collection, process_singel_file
 from langchain.text_splitter import CharacterTextSplitter
 import hashlib
 import numpy as np
@@ -82,13 +82,14 @@ def _list_rag_files():
 
 
 def _sync_rag_documents_if_needed():
-    if 'vector_store' not in globals() or 'embedder' not in globals():
+    current_vector_store, current_embedder = get_vector_components()
+    if not current_vector_store or not current_embedder:
         return
     try:
         RagKnowledgeSyncService(
             base_dir=str(settings.BASE_DIR),
-            vector_store=vector_store,
-            embedder=embedder,
+            vector_store=current_vector_store,
+            embedder=current_embedder,
         ).sync()
     except Exception as exc:
         logger.warning("RAG 文档自动同步失败，回退到旧逻辑: %s", exc)
@@ -108,24 +109,60 @@ class _FallbackKnowledgeService:
         return ""
 
 
-try:
-    vector_cfg = getattr(settings, 'VECTOR_DB_CONFIG', {})
-    if getattr(settings, 'ENABLE_MILVUS', True) and vector_cfg:
-        vector_store = MilvusVectorStore(
-            host=vector_cfg['host'],
-            port=vector_cfg['port'],
-            collection_name=vector_cfg['collection_name']
-        )
-        embedder = BGEM3Embedder(
-            model_name="BAAI/bge-m3"
-        )
-        knowledge_service = KnowledgeService(vector_store, embedder)
-    else:
+_knowledge_service_lock = threading.Lock()
+_knowledge_service_instance = None
+vector_store = None
+embedder = None
+
+
+def _build_knowledge_service():
+    global vector_store, embedder
+    try:
+        vector_cfg = getattr(settings, 'VECTOR_DB_CONFIG', {})
+        if getattr(settings, 'ENABLE_MILVUS', True) and vector_cfg:
+            vector_store = MilvusVectorStore(
+                host=vector_cfg['host'],
+                port=vector_cfg['port'],
+                collection_name=vector_cfg['collection_name']
+            )
+            embedder = BGEM3Embedder(
+                model_name="BAAI/bge-m3"
+            )
+            return KnowledgeService(vector_store, embedder)
+
         logger.warning("Milvus disabled or VECTOR_DB_CONFIG missing, using fallback knowledge service.")
-        knowledge_service = _FallbackKnowledgeService()
-except Exception as exc:
-    logger.warning(f"Milvus init failed, using fallback knowledge service: {exc}")
-    knowledge_service = _FallbackKnowledgeService()
+    except Exception as exc:
+        logger.warning(f"Milvus init failed, using fallback knowledge service: {exc}")
+
+    vector_store = None
+    embedder = None
+    return _FallbackKnowledgeService()
+
+
+def get_knowledge_service():
+    global _knowledge_service_instance
+    if _knowledge_service_instance is None:
+        with _knowledge_service_lock:
+            if _knowledge_service_instance is None:
+                _knowledge_service_instance = _build_knowledge_service()
+    return _knowledge_service_instance
+
+
+def get_vector_components():
+    service = get_knowledge_service()
+    if isinstance(service, _FallbackKnowledgeService):
+        return None, None
+    return vector_store, embedder
+
+
+class _LazyKnowledgeService:
+    """延迟初始化知识库，避免 Django 启动阶段加载 BGE-M3。"""
+
+    def __getattr__(self, item):
+        return getattr(get_knowledge_service(), item)
+
+
+knowledge_service = _LazyKnowledgeService()
 # test_case_generator = TestCaseGeneratorAgent(llm_service, knowledge_service)
 #test_case_reviewer = TestCaseReviewerAgent(llm_service, knowledge_service)
 
@@ -423,15 +460,15 @@ def knowledge_view(request):
 def add_knowledge(request):
     """添加知识条目"""
     try:
-        data = json.loads(request.body)
-        title = data.get('title')
-        content = data.get('content')
+        data = json.loads(request.body or "{}")
+        title = str(data.get('title') or '').strip()
+        content = str(data.get('content') or '').strip()
         
         if not title or not content:
             return JsonResponse({
                 'success': False,
                 'message': '标题和内容不能为空'
-            })
+            }, status=400)
         
         knowledge_id = knowledge_service.add_knowledge(title, content)
         
@@ -440,11 +477,16 @@ def add_knowledge(request):
             'message': '知识条目添加成功',
             'knowledge_id': knowledge_id
         })
+    except json.JSONDecodeError:
+        return JsonResponse({
+            'success': False,
+            'message': '无效的JSON数据'
+        }, status=400)
     except Exception as e:
         return JsonResponse({
             'success': False,
             'message': str(e)
-        })
+        }, status=500)
 
 def knowledge_list(request):
     """获取知识库条目"""
@@ -454,10 +496,15 @@ def knowledge_list(request):
         items = []
         for item in knowledge_items:
             items.append({
+                'entry_id': f'manual:{item.id}',
+                'entry_type': 'manual',
                 'id': item.id,
                 'title': item.title,
                 'content': item.content,
-                'created_at': item.created_at.isoformat()
+                'summary': item.content[:160],
+                'source': '手动添加',
+                'created_at': item.created_at.isoformat(),
+                'updated_at': item.updated_at.isoformat()
             })
         
         return JsonResponse({
@@ -496,7 +543,8 @@ def _build_rag_knowledge_items():
     rag_files = _list_rag_files()
     items = []
     for source in rag_files:
-        chunks = vector_store.get_document_chunks(source) if 'vector_store' in globals() else []
+        current_vector_store, _ = get_vector_components()
+        chunks = current_vector_store.get_document_chunks(source) if current_vector_store else []
         latest_upload_time = max((str(chunk.get('upload_time') or '') for chunk in chunks), default='')
         content_preview = ''
         if chunks:
@@ -577,7 +625,8 @@ def knowledge_library_detail(request):
                 return JsonResponse({'success': False, 'message': '未找到对应知识库文件'}, status=404)
             with open(abs_path, 'r', encoding='utf-8') as fh:
                 full_content = fh.read()
-            chunks = vector_store.get_document_chunks(source) if 'vector_store' in globals() else []
+            current_vector_store, _ = get_vector_components()
+            chunks = current_vector_store.get_document_chunks(source) if current_vector_store else []
             latest_upload_time = max((str(chunk.get('upload_time') or '') for chunk in chunks), default='')
             return JsonResponse({
                 'success': True,
@@ -615,9 +664,7 @@ def search_knowledge(request):
                 'success': False,
                 'message': '搜索关键词不能为空'
             })
-        
-        query_embedding = embedder.get_embeddings(query)[0]
-        logger.info(f"查询文本: '{query}', 向量长度: {len(query_embedding)}, 前五个维度: {query_embedding[:5]}")
+
         results = knowledge_service.search_knowledge(query)
         
         return JsonResponse({
@@ -691,6 +738,7 @@ def upload_single_file(request):
                         f.write(chunk)
                 logger.info(f"临时文件保存成功, 文件保存路径: {file_path}")
 
+                from .milvus_helper import process_singel_file
                 chunks = process_singel_file(file_path)  # 获取初始数据和文本切分结果
                 if not chunks:
                     return JsonResponse({'success': False, 'error': '文件没有有效内容可供处理'})
@@ -715,7 +763,14 @@ def upload_single_file(request):
                 start_time = datetime.now()
 
                 try:
-                    all_embeddings = embedder.get_embeddings(texts=text_contents, show_progress_bar=False)
+                    current_vector_store, current_embedder = get_vector_components()
+                    if not current_vector_store or not current_embedder:
+                        return JsonResponse({
+                            'success': False,
+                            'error': 'Milvus 或嵌入模型不可用，无法导入知识库'
+                        }, status=503)
+
+                    all_embeddings = current_embedder.get_embeddings(texts=text_contents, show_progress_bar=False)
                     logger.info(f"成功生成 {len(all_embeddings)} 段向量")
                     
                     embeddings_list = []
@@ -738,7 +793,7 @@ def upload_single_file(request):
                         data_to_insert.append(item)
                     
                     logger.info(f"准备向milvus插入{len(data_to_insert)} 条数据")
-                    vector_store.add_data(data_to_insert)
+                    current_vector_store.add_data(data_to_insert)
                     logger.info("数据插入完成")
                     
                     total_time = (datetime.now() - start_time).total_seconds()

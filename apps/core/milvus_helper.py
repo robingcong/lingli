@@ -10,6 +10,7 @@ from unstructured.chunking.title import chunk_by_title
 from unstructured.partition.auto import partition
 from unstructured.partition.xlsx import partition_xlsx
 
+from apps.knowledge.embedding import resolve_embedding_model_source
 from apps.knowledge.vector_store import MilvusVectorStore
 from utils.logger_manager import get_logger
 
@@ -21,7 +22,10 @@ _embedding_model = None
 def get_embedding_model():
     global _embedding_model
     if _embedding_model is None:
-        _embedding_model = SentenceTransformer("BAAI/bge-m3", trust_remote_code=True)
+        _embedding_model = SentenceTransformer(
+            resolve_embedding_model_source("BAAI/bge-m3"),
+            trust_remote_code=True,
+        )
     return _embedding_model
 
 

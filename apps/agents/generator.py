@@ -1,9 +1,15 @@
 from typing import Dict, Any, List, Optional, Set, Union
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from dataclasses import dataclass
 import json
 import re
+import time
+import uuid
 from difflib import SequenceMatcher
 
 from django.conf import settings
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from ..llm.base import BaseLLMService
 from ..knowledge.service import KnowledgeService
@@ -13,8 +19,273 @@ from .reviewer import TestCaseReviewerAgent
 from utils.logger_manager import get_logger
 
 
+@dataclass
+class NormalizedRequirementBundle:
+    raw_input: str
+    input_type: str
+    summary: str
+    functional_focus_tags: List[str]
+    nonfunctional_focus_tags: List[str]
+
+
+@dataclass
+class GenerationSubtask:
+    agent_role: str
+    coverage_tags: List[str]
+    request_count: int
+
+
+@dataclass
+class GenerationPreferences:
+    generation_profile: str
+    focus_points: List[str]
+    focus_strength: str
+
+
+class AgentRunTrace:
+    def __init__(self, mode: str, target_count: int, config_snapshot: Dict[str, Any]):
+        self._started_at = time.perf_counter()
+        self._data: Dict[str, Any] = {
+            "request_id": uuid.uuid4().hex,
+            "mode": mode,
+            "status": "running",
+            "target_count": target_count,
+            "returned_count": 0,
+            "total_elapsed_ms": 0.0,
+            "config": config_snapshot,
+            "metadata": {},
+            "steps": [],
+            "errors": [],
+        }
+
+    @contextmanager
+    def stage(self, name: str, **metadata):
+        started_at = time.perf_counter()
+        step = {
+            "name": name,
+            "elapsed_ms": 0.0,
+            "metadata": dict(metadata),
+        }
+        try:
+            yield step
+        except Exception as exc:
+            step["error"] = str(exc)
+            raise
+        finally:
+            step["elapsed_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
+            self._data["steps"].append(step)
+
+    def update(self, **metadata) -> None:
+        self._data["metadata"].update(metadata)
+
+    def fail(self, exc: Exception) -> None:
+        self._data["errors"].append(str(exc))
+
+    def finish(self, status: str, returned_count: int) -> Dict[str, Any]:
+        self._data["status"] = status
+        self._data["returned_count"] = returned_count
+        self._data["total_elapsed_ms"] = round((time.perf_counter() - self._started_at) * 1000, 2)
+        return self.to_dict()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            **self._data,
+            "metadata": dict(self._data["metadata"]),
+            "steps": [
+                {
+                    **step,
+                    "metadata": dict(step.get("metadata") or {}),
+                }
+                for step in self._data["steps"]
+            ],
+            "errors": list(self._data["errors"]),
+        }
+
+
+class RequirementNormalizerAgent:
+    FUNCTIONAL_FOCUS_TAGS = ["主流程", "关键分支", "边界条件", "异常处理"]
+    CATEGORY_TO_COVERAGE = {
+        "性能测试": "性能",
+        "安全测试": "安全",
+        "兼容性测试": "兼容性",
+        "稳定性测试": "稳定性",
+    }
+
+    def normalize(
+        self,
+        input_text: str,
+        input_type: str,
+        case_categories: List[str],
+    ) -> NormalizedRequirementBundle:
+        clean_text = (input_text or "").strip()
+        summary_lines = [line.strip() for line in clean_text.splitlines() if line.strip()][:8]
+        summary = "\n".join(f"- {line}" for line in summary_lines) if summary_lines else clean_text
+        requested_nonfunctional = []
+        for category in case_categories:
+            coverage = self.CATEGORY_TO_COVERAGE.get(category)
+            if coverage and coverage not in requested_nonfunctional:
+                requested_nonfunctional.append(coverage)
+        return NormalizedRequirementBundle(
+            raw_input=clean_text,
+            input_type=input_type,
+            summary=summary,
+            functional_focus_tags=list(self.FUNCTIONAL_FOCUS_TAGS),
+            nonfunctional_focus_tags=requested_nonfunctional,
+        )
+
+
+class CoverageAuditorAgent:
+    def __init__(self, coverage_keywords: Dict[str, tuple[str, ...]]):
+        self.coverage_keywords = coverage_keywords
+
+    def required_coverages_for_target(
+        self,
+        target_count: int,
+        bundle: NormalizedRequirementBundle,
+    ) -> List[str]:
+        required = list(bundle.functional_focus_tags)
+        for tag in bundle.nonfunctional_focus_tags:
+            if tag not in required:
+                required.append(tag)
+        return required
+
+    def detect_coverage_tags(self, case: Dict[str, Any]) -> Set[str]:
+        text = " ".join(
+            [case.get("description", "")]
+            + case.get("test_steps", [])
+            + case.get("expected_results", [])
+        ).lower()
+        coverage_tags: Set[str] = set()
+        for tag, keywords in self.coverage_keywords.items():
+            if any(keyword.lower() in text for keyword in keywords):
+                coverage_tags.add(tag)
+        return coverage_tags
+
+    def collect_missing_coverages(
+        self,
+        cases: List[Dict[str, Any]],
+        target_count: int,
+        bundle: NormalizedRequirementBundle,
+    ) -> List[str]:
+        covered: Set[str] = set()
+        for case in cases:
+            covered.update(case.get("_coverage_tags") or self.detect_coverage_tags(case))
+        return [tag for tag in self.required_coverages_for_target(target_count, bundle) if tag not in covered]
+
+
+class ParallelGenerationWorkerAgent:
+    def __init__(
+        self,
+        agent_role: str,
+        llm_service: BaseLLMService,
+        prompt: TestCaseGeneratorPrompt,
+        parser,
+        logger,
+    ):
+        self.agent_role = agent_role
+        self.llm_service = llm_service
+        self.prompt = prompt
+        self.parser = parser
+        self.logger = logger
+
+    def generate(
+        self,
+        requirements: str,
+        case_design_methods: str,
+        case_categories: str,
+        knowledge_context: Union[str, RAGContextResult],
+        subtask: GenerationSubtask,
+        existing_case_summaries: List[str],
+        retry_round: int,
+        requirement_summary: str,
+    ) -> List[Dict[str, Any]]:
+        messages = self.prompt.format_messages(
+            requirements=requirements,
+            case_design_methods=case_design_methods,
+            case_categories=case_categories,
+            case_count=subtask.request_count,
+            knowledge_context=knowledge_context,
+            missing_coverage_tags=subtask.coverage_tags,
+            existing_case_summaries=existing_case_summaries,
+            retry_round=retry_round,
+            agent_role=self.agent_role,
+            focus_coverage_tags=subtask.coverage_tags,
+            requirement_summary=requirement_summary,
+        )
+        self.logger.info(
+            "%s 构建后大模型提示词+用户需求消息: \n%s\n%s\n%s",
+            self.agent_role,
+            "=" * 50,
+            messages,
+            "=" * 50,
+        )
+        response = self.llm_service.invoke(messages)
+        result = response.content if hasattr(response, "content") else str(response)
+        self.logger.info("%s LLM原始响应: \n%s\n%s\n%s", self.agent_role, "=" * 50, result, "=" * 50)
+        return self.parser(result)
+
+
 class TestCaseGeneratorAgent:
     """测试用例生成Agent"""
+
+    GENERATION_PROFILE_RULES = {
+        "balanced": {
+            "label": "均衡生成",
+            "rules": [
+                "均衡覆盖功能、异常、边界和非功能场景。",
+                "不要让某一种场景压倒其他关键覆盖维度。",
+            ],
+        },
+        "feature_first": {
+            "label": "功能点优先",
+            "rules": [
+                "尽量拆出更多功能点，每个明确按钮、入口、字段、状态、列表、详情都可以独立成 case。",
+                "优先扩大功能覆盖面，避免只围绕一个主流程反复变化描述。",
+            ],
+        },
+        "exception_first": {
+            "label": "异常边界优先",
+            "rules": [
+                "增加失败路径、非法输入、边界值、空值、超时、中断、重复提交和错误提示场景。",
+                "异常 case 必须写清触发条件、系统提示和恢复结果。",
+            ],
+        },
+        "business_flow": {
+            "label": "业务链路优先",
+            "rules": [
+                "围绕真实业务闭环生成，写清前置条件、操作路径、数据变化、列表回显和上下游联动。",
+                "优先覆盖跨页面、跨状态、跨模块的数据一致性验证。",
+            ],
+        },
+        "nonfunctional_first": {
+            "label": "非功能优先",
+            "rules": [
+                "增加性能、安全、兼容性、稳定性相关 case 的占比。",
+                "非功能 case 必须给出可观察指标、触发条件和验收标准。",
+            ],
+        },
+    }
+    FOCUS_STRENGTH_RULES = {
+        "light": "轻度：只作为补充倾向，不改变整体覆盖均衡。",
+        "medium": "中度：明显提高这些偏向点的覆盖优先级。",
+        "strong": "强度：优先围绕这些偏向点生成；如果数量有限，先满足偏向点。",
+    }
+    ALLOWED_FOCUS_POINTS = {
+        "主流程",
+        "功能子点",
+        "页面交互",
+        "业务链路",
+        "状态流转",
+        "权限差异",
+        "边界条件",
+        "异常处理",
+        "数据一致性",
+        "上下游联动",
+        "性能",
+        "安全",
+        "兼容性",
+        "稳定性",
+    }
 
     COVERAGE_KEYWORDS = {
         "主流程": ("主流程", "正常", "成功", "标准", "基础", "happy path"),
@@ -38,6 +309,7 @@ class TestCaseGeneratorAgent:
         case_count: int = 10,
         reviewer_agent: Optional[TestCaseReviewerAgent] = None,
         quality_config: Optional[Dict[str, Any]] = None,
+        generation_preferences: Optional[Dict[str, Any]] = None,
     ):
         self.llm_service = llm_service
         self.case_design_methods = case_design_methods
@@ -52,56 +324,274 @@ class TestCaseGeneratorAgent:
             **(quality_config or {}),
         }
         self.reviewer_agent = reviewer_agent or TestCaseReviewerAgent(llm_service, knowledge_service)
+        self._review_cache: Dict[str, Dict[str, Any]] = {}
+        self.fast_mode = bool(self.quality_config.get("fast_mode", True))
+        self.enable_llm_review = bool(self.quality_config.get("enable_llm_review", False))
+        self.fast_single_call = bool(self.quality_config.get("fast_single_call", True))
+        self.generation_preferences = self._normalize_generation_preferences(generation_preferences or {})
+        self.last_run_trace: Dict[str, Any] = {}
+        self.requirement_normalizer = RequirementNormalizerAgent()
+        self.coverage_auditor = CoverageAuditorAgent(self.COVERAGE_KEYWORDS)
+        self.functional_generator = ParallelGenerationWorkerAgent(
+            agent_role="functional-case-generator",
+            llm_service=llm_service,
+            prompt=self.prompt,
+            parser=self._parse_generated_cases,
+            logger=self.logger,
+        )
+        self.nonfunctional_generator = ParallelGenerationWorkerAgent(
+            agent_role="nonfunctional-case-generator",
+            llm_service=llm_service,
+            prompt=self.prompt,
+            parser=self._parse_generated_cases,
+            logger=self.logger,
+        )
 
     def generate(self, input_text: str, input_type: str = "requirement") -> List[Dict[str, Any]]:
         """生成测试用例"""
         self.logger.info("开始生成测试用例,进入生成测试用例的TestCaseGeneratorAgent")
-        knowledge_context = self._get_knowledge_context(input_text)
-        knowledge_preview = (
-            knowledge_context.context_text
-            if isinstance(knowledge_context, RAGContextResult)
-            else str(knowledge_context or "")
-        )
-        self.logger.info(f"获取到知识库上下文: \n{'='*50}\n{knowledge_preview}\n{'='*50}")
-
         effective_target_count = self._get_effective_target_count()
-        retained_cases: List[Dict[str, Any]] = []
-        max_total_rounds = max(1, int(self.quality_config.get("max_total_rounds", 3)))
+        trace = AgentRunTrace(
+            mode=self._generation_mode(),
+            target_count=effective_target_count,
+            config_snapshot=self._trace_config_snapshot(),
+        )
+        self.last_run_trace = trace.to_dict()
+        final_cases: List[Dict[str, Any]] = []
+        status = "failed"
 
-        for round_index in range(max_total_rounds):
-            missing_coverages = self._collect_missing_coverages(retained_cases, effective_target_count)
-            if round_index > 0 and len(retained_cases) >= effective_target_count and not missing_coverages:
-                break
+        try:
+            with trace.stage("knowledge_retrieval") as step:
+                knowledge_context = self._get_knowledge_context(input_text)
+                knowledge_preview = (
+                    knowledge_context.context_text
+                    if isinstance(knowledge_context, RAGContextResult)
+                    else str(knowledge_context or "")
+                )
+                step["metadata"].update({
+                    "has_context": bool(knowledge_preview.strip()),
+                    "context_chars": len(knowledge_preview),
+                })
+            self.logger.info(f"获取到知识库上下文: \n{'='*50}\n{knowledge_preview}\n{'='*50}")
 
-            request_count = self._get_request_case_count(effective_target_count, len(retained_cases), round_index)
-            candidate_cases = self._generate_candidate_cases(
-                input_text=input_text,
-                knowledge_context=knowledge_context,
-                request_count=request_count,
-                missing_coverages=missing_coverages,
-                existing_case_summaries=self._build_case_summaries(retained_cases),
-                retry_round=round_index,
+            with trace.stage("requirement_normalization") as step:
+                requirement_bundle = self.requirement_normalizer.normalize(
+                    input_text=input_text,
+                    input_type=input_type,
+                    case_categories=self.case_categories,
+                )
+                step["metadata"].update({
+                    "input_type": input_type,
+                    "summary_chars": len(requirement_bundle.summary),
+                })
+
+            retained_cases: List[Dict[str, Any]] = []
+            if self.fast_mode and self.fast_single_call:
+                with trace.stage("llm_generation", requested_count=effective_target_count) as step:
+                    candidate_cases = self._generate_fast_candidates(
+                        requirement_bundle=requirement_bundle,
+                        knowledge_context=knowledge_context,
+                        target_count=effective_target_count,
+                    )
+                    step["metadata"]["candidate_count"] = len(candidate_cases)
+
+                with trace.stage("quality_filtering", candidate_count=len(candidate_cases)) as step:
+                    deduped_cases = self._deduplicate_test_cases(candidate_cases)
+                    qualified_cases = self._quality_filter_cases(deduped_cases)
+                    retained_cases = self._select_cases_for_target(qualified_cases, effective_target_count)
+                    missing_coverages = self.coverage_auditor.collect_missing_coverages(
+                        retained_cases,
+                        effective_target_count,
+                        requirement_bundle,
+                    )
+                    step["metadata"].update({
+                        "deduped_count": len(deduped_cases),
+                        "qualified_count": len(qualified_cases),
+                        "retained_count": len(retained_cases),
+                        "missing_coverages": missing_coverages,
+                    })
+                    trace.update(
+                        candidate_count=len(candidate_cases),
+                        deduped_count=len(deduped_cases),
+                        qualified_count=len(qualified_cases),
+                        retained_count=len(retained_cases),
+                        missing_coverages=missing_coverages,
+                    )
+                self.logger.info(
+                    "极速单次生成结束：候选=%d，保留=%d，缺失覆盖=%s",
+                    len(candidate_cases),
+                    len(retained_cases),
+                    missing_coverages,
+                )
+                if not retained_cases:
+                    raise ValueError("没有找到任何合法且达标的测试用例")
+                with trace.stage("finalization", retained_count=len(retained_cases)) as step:
+                    final_cases = self._finalize_cases(retained_cases, effective_target_count)
+                    step["metadata"]["returned_count"] = len(final_cases)
+                    trace.update(returned_count=len(final_cases))
+                status = "success"
+                return final_cases
+
+            max_total_rounds = max(1, int(self.quality_config.get("max_total_rounds", 3)))
+            if self.fast_mode:
+                max_total_rounds = 1
+
+            total_candidate_count = 0
+            for round_index in range(max_total_rounds):
+                with trace.stage(f"round_{round_index + 1}_planning") as step:
+                    missing_coverages = self.coverage_auditor.collect_missing_coverages(
+                        retained_cases,
+                        effective_target_count,
+                        requirement_bundle,
+                    )
+                    if round_index > 0 and len(retained_cases) >= effective_target_count and not missing_coverages:
+                        step["metadata"].update({
+                            "skipped": True,
+                            "reason": "target_count_and_coverage_satisfied",
+                        })
+                        break
+
+                    request_count = self._get_request_case_count(
+                        effective_target_count,
+                        len(retained_cases),
+                        round_index,
+                    )
+                    generation_subtasks = self._build_generation_subtasks(
+                        requirement_bundle=requirement_bundle,
+                        missing_coverages=missing_coverages,
+                        request_count=request_count,
+                        round_index=round_index,
+                    )
+                    step["metadata"].update({
+                        "missing_coverages": missing_coverages,
+                        "request_count": request_count,
+                        "subtasks": [
+                            {
+                                "agent_role": subtask.agent_role,
+                                "coverage_tags": subtask.coverage_tags,
+                                "request_count": subtask.request_count,
+                            }
+                            for subtask in generation_subtasks
+                        ],
+                    })
+
+                with trace.stage(f"round_{round_index + 1}_generation") as step:
+                    candidate_cases = self._run_generation_subtasks(
+                        generation_subtasks=generation_subtasks,
+                        requirement_bundle=requirement_bundle,
+                        knowledge_context=knowledge_context,
+                        existing_case_summaries=self._build_case_summaries(retained_cases),
+                        retry_round=round_index,
+                    )
+                    total_candidate_count += len(candidate_cases)
+                    step["metadata"]["candidate_count"] = len(candidate_cases)
+
+                with trace.stage(f"round_{round_index + 1}_quality_filtering") as step:
+                    merged_cases = self._deduplicate_test_cases(retained_cases + candidate_cases)
+                    qualified_cases = self._quality_filter_cases(merged_cases)
+                    retained_cases = self._select_cases_for_target(qualified_cases, effective_target_count)
+                    round_missing_coverages = self.coverage_auditor.collect_missing_coverages(
+                        retained_cases,
+                        effective_target_count,
+                        requirement_bundle,
+                    )
+                    step["metadata"].update({
+                        "merged_count": len(merged_cases),
+                        "qualified_count": len(qualified_cases),
+                        "retained_count": len(retained_cases),
+                        "missing_coverages": round_missing_coverages,
+                    })
+
+                self.logger.info(
+                    "第 %d 轮结束：候选=%d，保留=%d，缺失覆盖=%s",
+                    round_index + 1,
+                    len(candidate_cases),
+                    len(retained_cases),
+                    round_missing_coverages,
+                )
+
+            trace.update(
+                candidate_count=total_candidate_count,
+                retained_count=len(retained_cases),
+                missing_coverages=self.coverage_auditor.collect_missing_coverages(
+                    retained_cases,
+                    effective_target_count,
+                    requirement_bundle,
+                ),
             )
 
-            merged_cases = self._deduplicate_test_cases(retained_cases + candidate_cases)
-            qualified_cases = self._review_and_filter_cases(merged_cases)
-            retained_cases = self._select_cases_for_target(qualified_cases, effective_target_count)
+            if not retained_cases:
+                raise ValueError("没有找到任何合法且达标的测试用例")
 
-            self.logger.info(
-                "第 %d 轮结束：候选=%d，保留=%d，缺失覆盖=%s",
-                round_index + 1,
-                len(candidate_cases),
-                len(retained_cases),
-                self._collect_missing_coverages(retained_cases, effective_target_count),
-            )
+            with trace.stage("finalization", retained_count=len(retained_cases)) as step:
+                final_cases = self._finalize_cases(retained_cases, effective_target_count)
+                step["metadata"]["returned_count"] = len(final_cases)
+                trace.update(returned_count=len(final_cases))
+            if not final_cases:
+                raise ValueError("没有找到任何合法且达标的测试用例")
+            status = "success"
+            return final_cases
+        except Exception as exc:
+            trace.fail(exc)
+            raise
+        finally:
+            self.last_run_trace = trace.finish(status=status, returned_count=len(final_cases))
 
-        if not retained_cases:
-            raise ValueError("没有找到任何合法且达标的测试用例")
+    def _generation_mode(self) -> str:
+        if self.fast_mode and self.fast_single_call:
+            return "fast_single_call"
+        if self.fast_mode:
+            return "fast_parallel"
+        if self.enable_llm_review:
+            return "deep_with_review"
+        return "deep_local_filter"
 
-        final_cases = self._finalize_cases(retained_cases, effective_target_count)
-        if not final_cases:
-            raise ValueError("没有找到任何合法且达标的测试用例")
-        return final_cases
+    def _trace_config_snapshot(self) -> Dict[str, Any]:
+        return {
+            "fast_mode": self.fast_mode,
+            "fast_single_call": self.fast_single_call,
+            "enable_llm_review": self.enable_llm_review,
+            "case_count": self.case_count,
+            "case_categories": list(self.case_categories),
+            "case_design_methods": list(self.case_design_methods),
+            "generation_preferences": self._generation_preferences_dict(),
+            "default_target_count": self.quality_config.get("default_target_count"),
+            "max_total_rounds": self.quality_config.get("max_total_rounds"),
+        }
+
+    def _normalize_generation_preferences(self, preferences: Dict[str, Any]) -> GenerationPreferences:
+        profile = str(
+            preferences.get("generation_profile")
+            or preferences.get("profile")
+            or "balanced"
+        ).strip()
+        if profile not in self.GENERATION_PROFILE_RULES:
+            profile = "balanced"
+
+        raw_focus_points = preferences.get("focus_points") or []
+        if isinstance(raw_focus_points, str):
+            raw_focus_points = [raw_focus_points]
+        focus_points = []
+        for item in raw_focus_points:
+            point = str(item).strip()
+            if point in self.ALLOWED_FOCUS_POINTS and point not in focus_points:
+                focus_points.append(point)
+
+        strength = str(preferences.get("focus_strength") or "medium").strip()
+        if strength not in self.FOCUS_STRENGTH_RULES:
+            strength = "medium"
+        return GenerationPreferences(
+            generation_profile=profile,
+            focus_points=focus_points,
+            focus_strength=strength,
+        )
+
+    def _generation_preferences_dict(self) -> Dict[str, Any]:
+        return {
+            "generation_profile": self.generation_preferences.generation_profile,
+            "focus_points": list(self.generation_preferences.focus_points),
+            "focus_strength": self.generation_preferences.focus_strength,
+        }
 
     def _get_effective_target_count(self) -> int:
         if self.case_count and self.case_count > 0:
@@ -116,34 +606,200 @@ class TestCaseGeneratorAgent:
             return max(remaining * multiplier, minimum)
         return max(remaining * multiplier, max(1, len(self._required_coverages_for_target(target_count))))
 
-    def _generate_candidate_cases(
+    def _build_generation_subtasks(
         self,
-        input_text: str,
-        knowledge_context: Union[str, RAGContextResult],
-        request_count: int,
+        requirement_bundle: NormalizedRequirementBundle,
         missing_coverages: List[str],
+        request_count: int,
+        round_index: int,
+    ) -> List[GenerationSubtask]:
+        functional_focus = [
+            item for item in missing_coverages if item in requirement_bundle.functional_focus_tags
+        ]
+        nonfunctional_focus = [
+            item for item in missing_coverages if item in requirement_bundle.nonfunctional_focus_tags
+        ]
+        if round_index == 0 and not functional_focus:
+            functional_focus = list(requirement_bundle.functional_focus_tags)
+        if round_index == 0 and not nonfunctional_focus and requirement_bundle.nonfunctional_focus_tags:
+            nonfunctional_focus = list(requirement_bundle.nonfunctional_focus_tags)
+
+        planned = []
+        if functional_focus:
+            planned.append(("functional-case-generator", functional_focus))
+        if nonfunctional_focus:
+            planned.append(("nonfunctional-case-generator", nonfunctional_focus))
+        if not planned:
+            planned.append(("functional-case-generator", list(requirement_bundle.functional_focus_tags)))
+
+        base_count = max(1, request_count // len(planned))
+        remainder = max(0, request_count - base_count * len(planned))
+        subtasks = []
+        for index, (agent_role, coverage_tags) in enumerate(planned):
+            subtasks.append(
+                GenerationSubtask(
+                    agent_role=agent_role,
+                    coverage_tags=coverage_tags,
+                    request_count=base_count + (1 if index < remainder else 0),
+                )
+            )
+        return subtasks
+
+    def _run_generation_subtasks(
+        self,
+        generation_subtasks: List[GenerationSubtask],
+        requirement_bundle: NormalizedRequirementBundle,
+        knowledge_context: Union[str, RAGContextResult],
         existing_case_summaries: List[str],
         retry_round: int,
     ) -> List[Dict[str, Any]]:
-        case_design_methods = ",".join(self.case_design_methods) if self.case_design_methods else ""
-        case_categories = ",".join(self.case_categories) if self.case_categories else ""
-        messages = self.prompt.format_messages(
-            requirements=input_text,
-            case_design_methods=case_design_methods,
-            case_categories=case_categories,
-            case_count=request_count,
+        if not generation_subtasks:
+            return []
+        if len(generation_subtasks) == 1:
+            return self._run_single_generation_subtask(
+                generation_subtasks[0],
+                requirement_bundle,
+                knowledge_context,
+                existing_case_summaries,
+                retry_round,
+            )
+
+        results_by_role: Dict[str, List[Dict[str, Any]]] = {}
+        with ThreadPoolExecutor(max_workers=len(generation_subtasks), thread_name_prefix="case-agent") as executor:
+            future_map = {
+                executor.submit(
+                    self._run_single_generation_subtask,
+                    subtask,
+                    requirement_bundle,
+                    knowledge_context,
+                    existing_case_summaries,
+                    retry_round,
+                ): subtask
+                for subtask in generation_subtasks
+            }
+            for future in as_completed(future_map):
+                subtask = future_map[future]
+                results_by_role[subtask.agent_role] = future.result()
+
+        merged_results: List[Dict[str, Any]] = []
+        for subtask in generation_subtasks:
+            merged_results.extend(results_by_role.get(subtask.agent_role, []))
+        return merged_results
+
+    def _run_single_generation_subtask(
+        self,
+        subtask: GenerationSubtask,
+        requirement_bundle: NormalizedRequirementBundle,
+        knowledge_context: Union[str, RAGContextResult],
+        existing_case_summaries: List[str],
+        retry_round: int,
+    ) -> List[Dict[str, Any]]:
+        worker = (
+            self.nonfunctional_generator
+            if subtask.agent_role == "nonfunctional-case-generator"
+            else self.functional_generator
+        )
+        return worker.generate(
+            requirements=requirement_bundle.raw_input,
+            case_design_methods=",".join(self.case_design_methods) if self.case_design_methods else "",
+            case_categories=",".join(self.case_categories) if self.case_categories else "",
             knowledge_context=knowledge_context,
-            missing_coverage_tags=missing_coverages,
+            subtask=subtask,
             existing_case_summaries=existing_case_summaries,
             retry_round=retry_round,
+            requirement_summary=self._append_generation_preferences_to_summary(requirement_bundle.summary),
         )
-        self.logger.info(f"构建后大模型提示词+用户需求消息: \n{'='*50}\n{messages}\n{'='*50}")
 
-        result = ""
+    def _generate_fast_candidates(
+        self,
+        requirement_bundle: NormalizedRequirementBundle,
+        knowledge_context: Union[str, RAGContextResult],
+        target_count: int,
+    ) -> List[Dict[str, Any]]:
+        messages = self._build_fast_generation_messages(
+            requirement_bundle=requirement_bundle,
+            knowledge_context=knowledge_context,
+            target_count=target_count,
+        )
+        self.logger.info("fast-case-generator 构建后短提示词: \n%s\n%s\n%s", "=" * 50, messages, "=" * 50)
+        response = self.llm_service.invoke(messages)
+        result = response.content if hasattr(response, "content") else str(response)
+        self.logger.info("fast-case-generator LLM原始响应: \n%s\n%s\n%s", "=" * 50, result, "=" * 50)
+        return self._parse_generated_cases(result)
+
+    def _build_fast_generation_messages(
+        self,
+        requirement_bundle: NormalizedRequirementBundle,
+        knowledge_context: Union[str, RAGContextResult],
+        target_count: int,
+    ) -> List[Any]:
+        required_coverages = self.coverage_auditor.required_coverages_for_target(
+            target_count,
+            requirement_bundle,
+        )
+        requirement_text = self._compact_requirement_text(requirement_bundle.raw_input, max_chars=1200)
+        knowledge_text = self._compact_knowledge_text(knowledge_context, max_chars=500)
+        categories = "、".join(self.case_categories) if self.case_categories else "功能测试"
+        methods = "、".join(self.case_design_methods[:4]) if self.case_design_methods else "等价类、边界值、场景法"
+        preference_lines = self._format_generation_preference_lines()
+        system = "\n".join(
+            [
+                "你是熟悉业务系统测试设计的高级测试专家。",
+                "目标：基于需求和知识库证据，快速生成业务贴合、可执行、可验证、不重复的测试用例。",
+                "只输出 JSON 数组，不要 Markdown，不要解释。",
+                "每个元素必须包含 description、test_steps、expected_results。",
+                "test_steps 与 expected_results 数量必须一致。",
+                "每条用例最多 4 个步骤，句子要短，但必须写清业务动作和可观察结果。",
+            ]
+        )
+        human = "\n".join(
+            [
+                f"请生成 {target_count} 条测试用例，类型：{categories}。",
+                f"优先使用方法：{methods}。",
+                f"必须尽量覆盖：{'、'.join(required_coverages)}。",
+                "未选择的测试类型不要生成独立 case；性能、安全、兼容、稳定性仅在测试类型、偏向点或需求原文明示时输出。",
+                *preference_lines,
+                "生成原则：",
+                "1. 优先围绕需求中的真实业务链路生成，不要泛化到无关功能。",
+                "2. 每条用例必须明确测试对象、操作动作、关键状态和业务结果。",
+                "3. 覆盖成功路径、失败路径、状态切换、权限差异、异常提示中的高价值场景。",
+                "4. 如果需求涉及按钮、弹窗、列表、详情、上传、调度、审批、启停、更新、删除，必须体现真实交互。",
+                "5. description 禁止写“验证功能正常”这类空泛描述。",
+                "强约束：只返回目标数量，不要多生成；每条 test_steps 最多 4 条，expected_results 最多 4 条。",
+                "",
+                "需求：",
+                requirement_text,
+                "",
+                "知识库证据：",
+                knowledge_text or "无",
+                "",
+                "返回 JSON 数组，格式示例：",
+                '[{"description":"...","test_steps":["1. ...","2. ..."],"expected_results":["1. ...","2. ..."]}]',
+            ]
+        )
+        return [SystemMessage(content=system), HumanMessage(content=human)]
+
+    def _format_generation_preference_lines(self) -> List[str]:
+        profile = self.GENERATION_PROFILE_RULES[self.generation_preferences.generation_profile]
+        strength_rule = self.FOCUS_STRENGTH_RULES[self.generation_preferences.focus_strength]
+        focus_points = "、".join(self.generation_preferences.focus_points) or "未指定，按生成模式自动判断"
+        lines = [
+            "个性化生成偏向：",
+            f"- 生成模式：{profile['label']}。",
+            f"- 偏向点：{focus_points}。",
+            f"- 偏向强度：{strength_rule}",
+            "- 偏向执行规则：",
+        ]
+        lines.extend(f"  - {rule}" for rule in profile["rules"])
+        if self.generation_preferences.focus_points:
+            lines.append("  - 选中的偏向点必须优先覆盖；每条 case 尽量体现至少一个偏向点。")
+        return lines
+
+    def _append_generation_preferences_to_summary(self, summary: str) -> str:
+        return "\n".join([summary, *self._format_generation_preference_lines()])
+
+    def _parse_generated_cases(self, result: str) -> List[Dict[str, Any]]:
         try:
-            response = self.llm_service.invoke(messages)
-            result = response.content if hasattr(response, "content") else str(response)
-            self.logger.info(f"LLM原始响应: \n{'='*50}\n{result}\n{'='*50}")
             json_str = self._extract_json_from_response(result)
             if not json_str:
                 raise ValueError("无法从响应中提取有效的JSON数据")
@@ -157,7 +813,15 @@ class TestCaseGeneratorAgent:
         """获取相关知识上下文"""
         try:
             if hasattr(self.knowledge_service, "search_relevant_knowledge_context"):
-                knowledge = self.knowledge_service.search_relevant_knowledge_context(input_text)
+                top_k = 2 if self.fast_mode else 3
+                max_chars_per_chunk = 220 if self.fast_mode else 350
+                max_total_chars = 500 if self.fast_mode else 1200
+                knowledge = self.knowledge_service.search_relevant_knowledge_context(
+                    input_text,
+                    top_k=top_k,
+                    max_chars_per_chunk=max_chars_per_chunk,
+                    max_total_chars=max_total_chars,
+                )
             else:
                 knowledge = self.knowledge_service.search_relevant_knowledge(input_text)
             if knowledge:
@@ -303,44 +967,89 @@ class TestCaseGeneratorAgent:
                 qualified_cases.append(next_case)
         return qualified_cases
 
+    def _quality_filter_cases(self, test_cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if self.enable_llm_review and not self.fast_mode:
+            return self._review_and_filter_cases(test_cases)
+        return self._local_quality_filter_cases(test_cases)
+
+    def _local_quality_filter_cases(self, test_cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        qualified_cases = []
+        for case in test_cases:
+            steps = case.get("test_steps") or []
+            expected = case.get("expected_results") or []
+            if not case.get("description") or not steps or not expected:
+                continue
+            if len(steps) != len(expected):
+                self.logger.info(
+                    "极速模式跳过步骤/预期数量不一致的用例: %s",
+                    case.get("description", ""),
+                )
+                continue
+            next_case = dict(case)
+            coverage_tags = sorted(self._detect_coverage_tags(next_case))
+            next_case["_coverage_tags"] = coverage_tags
+            next_case["_quality_score"] = 8 if coverage_tags else 7
+            next_case["_quality_recommendation"] = "本地规则通过"
+            next_case["_quality_review"] = {
+                "mode": "local_fast",
+                "checks": ["required_fields", "non_empty_steps", "step_expected_alignment"],
+            }
+            qualified_cases.append(next_case)
+        return qualified_cases
+
     def _review_cases_batch(self, test_cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not test_cases:
             return []
 
+        review_payloads: List[Optional[Dict[str, Any]]] = [None] * len(test_cases)
+        uncached_cases: List[Dict[str, Any]] = []
+        uncached_indexes: List[int] = []
+        for index, test_case in enumerate(test_cases):
+            cache_key = self._review_cache_key(test_case)
+            cached = self._review_cache.get(cache_key)
+            if cached is not None:
+                review_payloads[index] = cached
+                continue
+            uncached_cases.append(test_case)
+            uncached_indexes.append(index)
+
+        if not uncached_cases:
+            return [payload or {} for payload in review_payloads]
+
         batch_review = getattr(self.reviewer_agent, "review_case_batch", None)
         if callable(batch_review):
             try:
-                return batch_review(test_cases)
+                fresh_payloads = batch_review(uncached_cases)
             except Exception as exc:
                 self.logger.warning("批量评审失败，回退到逐条评审: %s", exc)
+                fresh_payloads = [self.reviewer_agent.review_case_data(case) for case in uncached_cases]
+        else:
+            fresh_payloads = [self.reviewer_agent.review_case_data(case) for case in uncached_cases]
 
-        return [self.reviewer_agent.review_case_data(case) for case in test_cases]
+        for index, test_case, payload in zip(uncached_indexes, uncached_cases, fresh_payloads):
+            safe_payload = payload or {}
+            self._review_cache[self._review_cache_key(test_case)] = safe_payload
+            review_payloads[index] = safe_payload
+        return [payload or {} for payload in review_payloads]
+
+    def _review_cache_key(self, test_case: Dict[str, Any]) -> str:
+        payload = {
+            "description": str(test_case.get("description", "")).strip(),
+            "test_steps": [str(item).strip() for item in test_case.get("test_steps", [])],
+            "expected_results": [str(item).strip() for item in test_case.get("expected_results", [])],
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
     def _required_coverages_for_target(self, target_count: int) -> List[str]:
-        required = ["主流程", "关键分支", "边界条件", "异常处理"]
-        if target_count >= 6:
-            required.extend(["性能", "安全"])
-        if target_count >= 8:
-            required.extend(["兼容性", "稳定性"])
-        return required
+        bundle = self.requirement_normalizer.normalize("", "requirement", self.case_categories)
+        return self.coverage_auditor.required_coverages_for_target(target_count, bundle)
 
     def _detect_coverage_tags(self, case: Dict[str, Any]) -> Set[str]:
-        text = " ".join(
-            [case.get("description", "")]
-            + case.get("test_steps", [])
-            + case.get("expected_results", [])
-        ).lower()
-        coverage_tags: Set[str] = set()
-        for tag, keywords in self.COVERAGE_KEYWORDS.items():
-            if any(keyword.lower() in text for keyword in keywords):
-                coverage_tags.add(tag)
-        return coverage_tags
+        return self.coverage_auditor.detect_coverage_tags(case)
 
     def _collect_missing_coverages(self, cases: List[Dict[str, Any]], target_count: int) -> List[str]:
-        covered: Set[str] = set()
-        for case in cases:
-            covered.update(case.get("_coverage_tags") or self._detect_coverage_tags(case))
-        return [tag for tag in self._required_coverages_for_target(target_count) if tag not in covered]
+        bundle = self.requirement_normalizer.normalize("", "requirement", self.case_categories)
+        return self.coverage_auditor.collect_missing_coverages(cases, target_count, bundle)
 
     def _select_cases_for_target(self, cases: List[Dict[str, Any]], target_count: int) -> List[Dict[str, Any]]:
         sorted_cases = sorted(
@@ -403,6 +1112,21 @@ class TestCaseGeneratorAgent:
         normalized = re.sub(r"[\W_]+", "", str(text).lower())
         normalized = normalized.replace("校验", "验证").replace("帐号", "账号")
         return normalized
+
+    def _compact_requirement_text(self, text: str, max_chars: int) -> str:
+        compact = re.sub(r"<[^>]+>", "\n", text or "")
+        compact = re.sub(r"&nbsp;|&#160;", " ", compact)
+        compact = re.sub(r"\n{2,}", "\n", compact)
+        compact = re.sub(r"[ \t]{2,}", " ", compact).strip()
+        return compact[:max_chars]
+
+    def _compact_knowledge_text(self, knowledge_context: Union[str, RAGContextResult], max_chars: int) -> str:
+        if isinstance(knowledge_context, RAGContextResult):
+            text = knowledge_context.context_text or ""
+        else:
+            text = str(knowledge_context or "")
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        return text[:max_chars]
 
     def _extract_json_from_response(self, response: str) -> str:
         """从响应中提取JSON部分并进行基础修复"""

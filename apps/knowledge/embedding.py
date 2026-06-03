@@ -6,6 +6,14 @@ from sentence_transformers import SentenceTransformer
 import numpy as np
 import os
 
+
+def resolve_embedding_model_source(model_name: str = "BAAI/bge-m3") -> str:
+    local_model_path = os.getenv("EMBEDDING_MODEL_PATH", "").strip()
+    if local_model_path:
+        return local_model_path
+    return "BAAI/bge-m3" if model_name == "bge-m3" else model_name
+
+
 class BGEM3Embedder:
     """BGE-M3嵌入模型本地服务 - 针对Apple Silicon优化"""
     
@@ -16,7 +24,7 @@ class BGEM3Embedder:
         Args:
             model_name: 模型名称，默认为'BAAI/bge-m3'
         """
-        resolved_model_name = "BAAI/bge-m3" if model_name == "bge-m3" else model_name
+        resolved_model_name = resolve_embedding_model_source(model_name)
         print("正在加载BGE-M3模型...")
         self.model = SentenceTransformer(resolved_model_name)
 

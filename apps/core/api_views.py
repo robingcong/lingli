@@ -7,9 +7,16 @@ from django.db.models import Q
 import json
 import time
 
-from .models import TestCase, PlaneWorkItem
+from .models import TestCase, PlaneWorkItem, TestCaseGenerationJob
 from .fetch_work_items import sync_work_items_to_db
 from .title_utils import build_test_case_title
+from .generation_jobs import (
+    create_generation_job,
+    ensure_generation_job_table,
+    serialize_generation_job,
+    serialize_generation_job_detail,
+    submit_generation_job,
+)
 from apps.llm import LLMServiceFactory
 from ..agents.generator import TestCaseGeneratorAgent
 from utils.logger_manager import get_logger
@@ -103,7 +110,7 @@ def dashboard(request):
 @require_http_methods(["GET"])
 def llm_providers(request):
     llm_config = getattr(settings, 'LLM_PROVIDERS', {})
-    default_provider = llm_config.get('default_provider', 'deepseek')
+    default_provider = llm_config.get('default_provider', 'kimi')
     providers = []
     for key, cfg in llm_config.items():
         if key == 'default_provider':
@@ -125,24 +132,37 @@ def test_cases_list(request):
     page = int(request.GET.get('page', 1))
     page_size = int(request.GET.get('page_size', 15))
 
-    qs = TestCase.objects.filter(status=status).order_by('-created_at')
+    qs = TestCase.objects.select_related("ai_review").order_by('-created_at')
+    if status and status != "all":
+        qs = qs.filter(status=status)
     paginator = Paginator(qs, page_size)
     try:
         page_obj = paginator.page(page)
     except EmptyPage:
         page_obj = paginator.page(paginator.num_pages)
 
-    items = [
-        {
+    items = []
+    for tc in page_obj.object_list:
+        ai_review = getattr(tc, "ai_review", None)
+        items.append({
             'id': tc.id,
             'title': tc.title,
             'description': tc.description,
             'requirements': tc.requirements,
+            'test_steps': tc.test_steps,
+            'expected_results': tc.expected_results,
             'status': tc.status,
-            'created_at': tc.created_at.isoformat()
-        }
-        for tc in page_obj.object_list
-    ]
+            'llm_provider': tc.llm_provider or '',
+            'created_at': tc.created_at.isoformat(),
+            'updated_at': tc.updated_at.isoformat() if tc.updated_at else '',
+            'ai_review': {
+                'provider': ai_review.provider,
+                'score': ai_review.score,
+                'recommendation': ai_review.recommendation,
+                'raw_result': ai_review.raw_result,
+                'updated_at': ai_review.updated_at.isoformat()
+            } if ai_review else None,
+        })
 
     return JsonResponse({
         'items': items,
@@ -151,6 +171,63 @@ def test_cases_list(request):
         'total': paginator.count,
         'total_pages': paginator.num_pages
     })
+
+
+@require_http_methods(["GET", "POST"])
+def generation_jobs(request):
+    ensure_generation_job_table()
+    if request.method == "POST":
+        try:
+            payload = json.loads(request.body or "{}")
+        except json.JSONDecodeError:
+            return JsonResponse({"success": False, "message": "无效的JSON数据"}, status=400)
+
+        try:
+            job = create_generation_job(payload)
+            submit_generation_job(job.id)
+            return JsonResponse(
+                {
+                    "success": True,
+                    "message": "任务已提交后台生成",
+                    "job_id": job.id,
+                    "job": serialize_generation_job(job),
+                },
+                status=202,
+            )
+        except ValueError as exc:
+            return JsonResponse({"success": False, "message": str(exc)}, status=400)
+        except Exception as exc:
+            logger.error("创建后台生成任务失败: %s", exc, exc_info=True)
+            return JsonResponse({"success": False, "message": f"创建任务失败: {exc}"}, status=500)
+
+    page = int(request.GET.get("page", 1))
+    page_size = int(request.GET.get("page_size", 20))
+    status_filter = (request.GET.get("status") or "").strip()
+    qs = TestCaseGenerationJob.objects.all().order_by("-created_at")
+    if status_filter:
+        qs = qs.filter(status=status_filter)
+    paginator = Paginator(qs, page_size)
+    try:
+        page_obj = paginator.page(page)
+    except EmptyPage:
+        page_obj = paginator.page(paginator.num_pages if paginator.num_pages else 1)
+    return JsonResponse({
+        "success": True,
+        "items": [serialize_generation_job(job) for job in page_obj.object_list],
+        "page": page_obj.number,
+        "page_size": page_size,
+        "total": paginator.count,
+        "total_pages": paginator.num_pages,
+    })
+
+
+@require_http_methods(["GET"])
+def generation_job_detail(request, job_id):
+    ensure_generation_job_table()
+    job = TestCaseGenerationJob.objects.filter(id=job_id).first()
+    if not job:
+        return JsonResponse({"success": False, "message": "未找到生成任务"}, status=404)
+    return JsonResponse({"success": True, **serialize_generation_job_detail(job)})
 
 
 @require_http_methods(["GET", "POST"])
@@ -258,6 +335,11 @@ def plane_one_click_generate(request):
     work_item_id = payload.get('work_item_id')
     llm_provider = payload.get('llm_provider')
     case_count = payload.get('case_count', 0)
+    generation_preferences = {
+        "generation_profile": payload.get("generation_profile") or "balanced",
+        "focus_points": payload.get("focus_points") or [],
+        "focus_strength": payload.get("focus_strength") or "medium",
+    }
 
     try:
         case_count = int(case_count)
@@ -274,7 +356,7 @@ def plane_one_click_generate(request):
         return JsonResponse({'success': False, 'message': '未找到对应的 Plane 工作项'}, status=404)
 
     llm_config = getattr(settings, 'LLM_PROVIDERS', {})
-    default_provider = llm_config.get('default_provider', 'deepseek')
+    default_provider = llm_config.get('default_provider', 'kimi')
     providers = {k: v for k, v in llm_config.items() if k != 'default_provider'}
     if not llm_provider:
         llm_provider = default_provider
@@ -290,10 +372,11 @@ def plane_one_click_generate(request):
     ])
 
     default_case_design_methods = ['等价类划分', '边界值分析', '判定表', '因果图', '正交分析', '场景法']
-    default_case_categories = ['功能测试', '性能测试', '兼容性测试', '安全测试']
+    default_case_categories = ['功能测试']
 
     test_cases = None
     effective_provider = llm_provider
+    generation_meta = {}
     provider_chain = [llm_provider]
     if llm_provider != "qwen" and "qwen" in providers:
         provider_chain.append("qwen")
@@ -312,8 +395,10 @@ def plane_one_click_generate(request):
                     case_design_methods=default_case_design_methods,
                     case_categories=default_case_categories,
                     case_count=case_count,
+                    generation_preferences=generation_preferences,
                 )
                 test_cases = generator_agent.generate(requirements, input_type="requirement")
+                generation_meta = getattr(generator_agent, "last_run_trace", {}) or {}
                 effective_provider = getattr(llm_service, "last_provider_used", active_provider) or active_provider
                 break
             except Exception as exc:
@@ -376,6 +461,7 @@ def plane_one_click_generate(request):
         'saved_count': len(created),
         'test_cases': test_cases,
         'test_case_ids': [obj.id for obj in created],
+        'generation_meta': generation_meta,
         'plane_item': {
             'id': item.id,
             'work_item_id': item.work_item_id,

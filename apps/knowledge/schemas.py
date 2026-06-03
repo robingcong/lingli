@@ -31,3 +31,15 @@ class RAGContextResult:
     @property
     def plain_text(self) -> str:
         return "\n\n".join(chunk.content for chunk in self.chunks if chunk.content)
+
+
+@dataclass
+class RAGContextEnvelope:
+    query: str
+    normalized_query: str
+    retrieval_mode: str
+    confidence_level: str
+    context_result: RAGContextResult
+    top_scores: List[float] = field(default_factory=list)
+    cache_hit: bool = False
+    latency_ms: float = 0.0

@@ -184,6 +184,142 @@ class PlaneOneClickGenerateTests(unittest.TestCase):
         self.assertEqual(payload["test_case_ids"], [1])
         self.assertEqual(payload["test_cases"][0]["description"], unique_description)
 
+    def test_plane_generate_returns_generation_meta_from_effective_agent(self):
+        unique_description = "设备列表展示正常-携带运行元信息"
+        request = self.factory.post(
+            "/api/plane-one-click-generate/",
+            data=json.dumps({"id": self.item.id, "llm_provider": "qwen", "case_count": 1}),
+            content_type="application/json",
+        )
+
+        fake_settings = SimpleNamespace(
+            LLM_PROVIDERS={
+                "default_provider": "qwen",
+                "qwen": {"name": "Qwen", "model": "qwen-max", "api_key": "qwen-key"},
+            }
+        )
+
+        class FakeGenerator:
+            def __init__(self, llm_service, **kwargs):
+                self.llm_service = llm_service
+                self.last_run_trace = {}
+
+            def generate(self, requirements, input_type="requirement"):
+                self.last_run_trace = {
+                    "mode": "fast_single_call",
+                    "status": "success",
+                    "target_count": 1,
+                    "returned_count": 1,
+                    "steps": [{"name": "llm_generation", "elapsed_ms": 10.0}],
+                }
+                return [
+                    {
+                        "description": unique_description,
+                        "test_steps": ["进入设备列表"],
+                        "expected_results": ["看到设备列表数据"],
+                    }
+                ]
+
+        def fake_create(provider, **config):
+            return SimpleNamespace(provider=provider, last_provider_used=provider)
+
+        fake_filter_result = MagicMock()
+        fake_filter_result.first.return_value = self.item
+
+        def fake_bulk_create(objs):
+            for index, obj in enumerate(objs, start=1):
+                obj.id = index
+            return objs
+
+        with (
+            patch("apps.core.api_views.settings", fake_settings),
+            patch("apps.core.api_views._ensure_plane_work_item_table"),
+            patch("apps.core.views.knowledge_service", object()),
+            patch("apps.core.api_views.PlaneWorkItem.objects.filter", return_value=fake_filter_result),
+            patch("apps.core.api_views.LLMServiceFactory.create", side_effect=fake_create),
+            patch("apps.core.api_views.TestCaseGeneratorAgent", side_effect=FakeGenerator),
+            patch("apps.core.api_views.TestCase.objects.bulk_create", side_effect=fake_bulk_create),
+        ):
+            response = plane_one_click_generate(request)
+
+        payload = json.loads(response.content)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["generation_meta"]["mode"], "fast_single_call")
+        self.assertEqual(payload["generation_meta"]["returned_count"], 1)
+        self.assertEqual(payload["generation_meta"]["steps"][0]["name"], "llm_generation")
+
+    def test_plane_generate_passes_generation_preferences_to_agent(self):
+        unique_description = "设备列表功能点拆分-偏向配置"
+        request = self.factory.post(
+            "/api/plane-one-click-generate/",
+            data=json.dumps({
+                "id": self.item.id,
+                "llm_provider": "qwen",
+                "case_count": 2,
+                "generation_profile": "business_flow",
+                "focus_points": ["业务链路", "数据一致性", "上下游联动"],
+                "focus_strength": "medium",
+            }, ensure_ascii=False),
+            content_type="application/json",
+        )
+
+        fake_settings = SimpleNamespace(
+            LLM_PROVIDERS={
+                "default_provider": "qwen",
+                "qwen": {"name": "Qwen", "model": "qwen-max", "api_key": "qwen-key"},
+            }
+        )
+
+        class FakeGenerator:
+            last_kwargs = None
+
+            def __init__(self, llm_service, **kwargs):
+                type(self).last_kwargs = kwargs
+                self.last_run_trace = {}
+
+            def generate(self, requirements, input_type="requirement"):
+                self.last_run_trace = {"mode": "fast_single_call", "status": "success"}
+                return [
+                    {
+                        "description": unique_description,
+                        "test_steps": ["进入设备列表"],
+                        "expected_results": ["看到设备列表数据"],
+                    }
+                ]
+
+        def fake_create(provider, **config):
+            return SimpleNamespace(provider=provider, last_provider_used=provider)
+
+        fake_filter_result = MagicMock()
+        fake_filter_result.first.return_value = self.item
+
+        def fake_bulk_create(objs):
+            for index, obj in enumerate(objs, start=1):
+                obj.id = index
+            return objs
+
+        with (
+            patch("apps.core.api_views.settings", fake_settings),
+            patch("apps.core.api_views._ensure_plane_work_item_table"),
+            patch("apps.core.views.knowledge_service", object()),
+            patch("apps.core.api_views.PlaneWorkItem.objects.filter", return_value=fake_filter_result),
+            patch("apps.core.api_views.LLMServiceFactory.create", side_effect=fake_create),
+            patch("apps.core.api_views.TestCaseGeneratorAgent", side_effect=FakeGenerator),
+            patch("apps.core.api_views.TestCase.objects.bulk_create", side_effect=fake_bulk_create),
+        ):
+            response = plane_one_click_generate(request)
+
+        payload = json.loads(response.content)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(FakeGenerator.last_kwargs["generation_preferences"]["generation_profile"], "business_flow")
+        self.assertEqual(
+            FakeGenerator.last_kwargs["generation_preferences"]["focus_points"],
+            ["业务链路", "数据一致性", "上下游联动"],
+        )
+        self.assertEqual(FakeGenerator.last_kwargs["generation_preferences"]["focus_strength"], "medium")
+
 
 class PlaneWorkItemsFilterTests(unittest.TestCase):
     def setUp(self):

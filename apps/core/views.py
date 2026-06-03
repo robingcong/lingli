@@ -50,7 +50,7 @@ logger = get_logger(__name__)
 
 llm_config = getattr(settings, 'LLM_PROVIDERS', {})
 
-DEFAULT_PROVIDER = llm_config.get('default_provider', 'deepseek')
+DEFAULT_PROVIDER = llm_config.get('default_provider', 'kimi')
 
 PROVIDERS = {k: v for k, v in llm_config.items() if k != 'default_provider'}
 
@@ -180,15 +180,17 @@ def generate(request):
         '场景法'
     ]
     default_case_categories = [
-        '功能测试',
-        '性能测试',
-        '兼容性测试',
-        '安全测试'
+        '功能测试'
     ]
 
     case_design_methods = data.get('case_design_methods') or default_case_design_methods
     case_categories = data.get('case_categories') or default_case_categories
     case_count = int(data.get('case_count', 0))
+    generation_preferences = {
+        "generation_profile": data.get("generation_profile") or "balanced",
+        "focus_points": data.get("focus_points") or [],
+        "focus_strength": data.get("focus_strength") or "medium",
+    }
     generation_quality_config = dict(getattr(settings, "TEST_CASE_GENERATION_CONFIG", {}))
     
     logger.info(f"接收到的数据: {json.dumps(data, ensure_ascii=False)}")
@@ -202,12 +204,14 @@ def generate(request):
             **provider_config,
             temperature=generation_quality_config.get("generation_temperature", 0.3),
         )
-        reviewer_llm_service = LLMServiceFactory.create(
-            llm_provider,
-            **provider_config,
-            temperature=generation_quality_config.get("review_temperature", 0.2),
-        )
-        reviewer_agent = TestCaseReviewerAgent(reviewer_llm_service, knowledge_service)
+        reviewer_agent = None
+        if generation_quality_config.get("enable_llm_review", False):
+            reviewer_llm_service = LLMServiceFactory.create(
+                llm_provider,
+                **provider_config,
+                temperature=generation_quality_config.get("review_temperature", 0.2),
+            )
+            reviewer_agent = TestCaseReviewerAgent(reviewer_llm_service, knowledge_service)
         generator_agent = TestCaseGeneratorAgent(
             llm_service=llm_service,
             knowledge_service=knowledge_service,
@@ -216,6 +220,7 @@ def generate(request):
             case_count=case_count,
             reviewer_agent=reviewer_agent,
             quality_config=generation_quality_config,
+            generation_preferences=generation_preferences,
         )
         logger.info(f"开始生成测试用例- 需求: {requirements}...")
         logger.info(f"选择的用例设计方法 {case_design_methods}")
@@ -231,7 +236,8 @@ def generate(request):
         
         return JsonResponse({
             'success': True,
-            'test_cases': test_cases
+            'test_cases': test_cases,
+            'generation_meta': getattr(generator_agent, "last_run_trace", {}) or {},
         })
             
     except Exception as e:

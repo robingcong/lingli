@@ -187,6 +187,9 @@ class TestCaseGeneratorPrompt:
         missing_coverage_tags: Optional[List[str]] = None,
         existing_case_summaries: Optional[List[str]] = None,
         retry_round: int = 0,
+        agent_role: str = "",
+        focus_coverage_tags: Optional[List[str]] = None,
+        requirement_summary: Optional[str] = None,
     ) -> list:
         """格式化消息
         
@@ -221,6 +224,24 @@ class TestCaseGeneratorPrompt:
             quantity_instruction=quantity_instruction,
             knowledge_context=knowledge_prompt
         )
+        if requirement_summary:
+            messages.append(
+                HumanMessage(
+                    content="\n".join(
+                        [
+                            "以下是主编排器整理后的需求摘要，请优先按照这些结构化要点理解需求：",
+                            requirement_summary,
+                        ]
+                    )
+                )
+            )
+        if agent_role:
+            role_lines = [f"你当前扮演 {agent_role}。"]
+            if focus_coverage_tags:
+                role_lines.append("你本轮专注覆盖维度：")
+                role_lines.extend(f"- {item}" for item in focus_coverage_tags)
+                role_lines.append("请优先生成覆盖以上维度的 case，避免和其他 agent 的职责重叠。")
+            messages.append(HumanMessage(content="\n".join(role_lines)))
         if missing_coverage_tags or existing_case_summaries or retry_round:
             supplement_lines = [
                 f"补齐要求：当前是第 {retry_round + 1} 轮生成，请避免重复已有测试点。"

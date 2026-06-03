@@ -187,7 +187,7 @@ class LLMServiceFactory:
         
         # 获取LLM配置
         llm_config = getattr(settings, 'LLM_PROVIDERS', {})
-        default_provider = llm_config.get('default_provider', 'deepseek')
+        default_provider = llm_config.get('default_provider', 'kimi')
         providers = {k: v for k, v in llm_config.items() if k != 'default_provider'}
         
         # 检查提供商是否存在

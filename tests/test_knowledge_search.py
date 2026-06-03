@@ -7,7 +7,7 @@ import django
 django.setup()
 
 from apps.knowledge.service import KnowledgeService
-from apps.knowledge.schemas import RAGContextResult
+from apps.knowledge.schemas import RAGContextEnvelope, RAGContextResult, RetrievedChunk
 
 
 class FakeEmbedder:
@@ -29,6 +29,23 @@ class FakeVectorStore:
         if not self.results_by_call:
             return []
         return self.results_by_call.pop(0)
+
+
+class CountingReranker:
+    def __init__(self, response=None):
+        self.calls = []
+        self.response = response or []
+
+    def rerank(self, documents, query, top_k, min_score_threshold):
+        self.calls.append(
+            {
+                "documents": documents,
+                "query": query,
+                "top_k": top_k,
+                "min_score_threshold": min_score_threshold,
+            }
+        )
+        return list(self.response)
 
 
 class KnowledgeSearchRollbackTests(unittest.TestCase):
@@ -65,7 +82,7 @@ class KnowledgeSearchRollbackTests(unittest.TestCase):
 
         self.assertEqual(context, "主库命中：设备列表页面展示设备基础信息。")
         self.assertEqual(embedder.calls, ["设备列表"])
-        self.assertEqual(primary_store.calls, [40])
+        self.assertEqual(primary_store.calls, [20])
         self.assertEqual(rag_store.calls, [])
 
     def test_search_relevant_knowledge_hybrid_rerank_can_keep_low_vector_scores(self):
@@ -162,6 +179,143 @@ class KnowledgeSearchRollbackTests(unittest.TestCase):
         self.assertEqual(result.dropped_chunk_count, 1)
         self.assertLessEqual(len(result.context_text), 220)
         self.assertTrue(result.chunks[0].truncated)
+
+    def test_search_relevant_knowledge_once_returns_high_confidence_fast_path_envelope(self):
+        embedder = FakeEmbedder()
+        primary_store = FakeVectorStore([
+            [
+                {
+                    "id": 1,
+                    "score": 0.93,
+                    "content": "设备列表展示设备名称、状态、电量和最近心跳时间。",
+                    "source": "uploads/device.md",
+                    "chunk_id": "device_0001",
+                    "doc_type": ".md",
+                },
+                {
+                    "id": 2,
+                    "score": 0.74,
+                    "content": "设备详情页支持查看定位信息、任务历史与告警记录。",
+                    "source": "uploads/device.md",
+                    "chunk_id": "device_0002",
+                    "doc_type": ".md",
+                },
+                {
+                    "id": 3,
+                    "score": 0.72,
+                    "content": "设备告警支持按时间和级别筛选。",
+                    "source": "uploads/device.md",
+                    "chunk_id": "device_0003",
+                    "doc_type": ".md",
+                },
+            ]
+        ])
+        service = KnowledgeService(vector_store=primary_store, embedder=embedder)
+        service.reranker = CountingReranker()
+
+        envelope = service.search_relevant_knowledge_once("设备列表", top_k=2)
+
+        self.assertIsInstance(envelope, RAGContextEnvelope)
+        self.assertEqual(envelope.retrieval_mode, "fast")
+        self.assertEqual(envelope.confidence_level, "high")
+        self.assertFalse(envelope.cache_hit)
+        self.assertEqual(service.reranker.calls, [])
+        self.assertEqual(envelope.context_result.used_chunk_count, 2)
+
+    def test_search_relevant_knowledge_once_uses_rerank_on_low_confidence_results(self):
+        embedder = FakeEmbedder()
+        primary_store = FakeVectorStore([
+            [
+                {
+                    "id": 1,
+                    "score": 0.61,
+                    "content": "飞行指点流程：起飞前先检查姿态与航线。",
+                    "source": "uploads/dispatch.md",
+                    "chunk_id": "dispatch_0001",
+                    "doc_type": ".md",
+                },
+                {
+                    "id": 2,
+                    "score": 0.60,
+                    "content": "设备测试流程：上电自检、链路测试。",
+                    "source": "uploads/dispatch.md",
+                    "chunk_id": "dispatch_0002",
+                    "doc_type": ".md",
+                },
+                {
+                    "id": 3,
+                    "score": 0.59,
+                    "content": "通用文档：与飞行无关。",
+                    "source": "uploads/dispatch.md",
+                    "chunk_id": "dispatch_0003",
+                    "doc_type": ".md",
+                },
+            ]
+        ])
+        service = KnowledgeService(vector_store=primary_store, embedder=embedder)
+        reranker = CountingReranker(
+            response=[
+                RetrievedChunk(
+                    content="飞行指点流程：起飞前先检查姿态与航线。",
+                    source="uploads/dispatch.md",
+                    chunk_id="dispatch_0001",
+                    doc_type=".md",
+                    vector_score=0.61,
+                    bm25_score=1.0,
+                    hybrid_score=0.82,
+                )
+            ]
+        )
+        service.reranker = reranker
+
+        envelope = service.search_relevant_knowledge_once("指点飞行", top_k=2)
+
+        self.assertEqual(envelope.retrieval_mode, "rerank")
+        self.assertEqual(envelope.confidence_level, "low")
+        self.assertEqual(len(reranker.calls), 1)
+        self.assertEqual(len(reranker.calls[0]["documents"]), 3)
+        self.assertEqual(envelope.context_result.used_chunk_count, 1)
+
+    def test_search_relevant_knowledge_once_caches_context_for_repeated_queries(self):
+        embedder = FakeEmbedder()
+        primary_store = FakeVectorStore([
+            [
+                {
+                    "id": 1,
+                    "score": 0.92,
+                    "content": "设备列表展示设备名称、状态、电量和最近心跳时间。",
+                    "source": "uploads/device.md",
+                    "chunk_id": "device_0001",
+                    "doc_type": ".md",
+                },
+                {
+                    "id": 2,
+                    "score": 0.79,
+                    "content": "设备详情页支持查看定位信息、任务历史与告警记录。",
+                    "source": "uploads/device.md",
+                    "chunk_id": "device_0002",
+                    "doc_type": ".md",
+                },
+                {
+                    "id": 3,
+                    "score": 0.73,
+                    "content": "设备告警支持按时间和级别筛选。",
+                    "source": "uploads/device.md",
+                    "chunk_id": "device_0003",
+                    "doc_type": ".md",
+                },
+            ]
+        ])
+        service = KnowledgeService(vector_store=primary_store, embedder=embedder)
+        service.reranker = CountingReranker()
+
+        first = service.search_relevant_knowledge_once("  设备列表  ", top_k=2)
+        second = service.search_relevant_knowledge_once("设备列表", top_k=2)
+
+        self.assertFalse(first.cache_hit)
+        self.assertTrue(second.cache_hit)
+        self.assertEqual(len(embedder.calls), 1)
+        self.assertEqual(primary_store.calls, [10])
 
 
 if __name__ == "__main__":

@@ -20,7 +20,6 @@
           <div>{{ stats.rejected }}</div>
         </div>
       </div>
-      <div class="notice" style="margin-top: 12px;">当前应用名称：灵例。可通过左侧“主题”按钮切换配色。</div>
     </div>
 
     <div class="card">

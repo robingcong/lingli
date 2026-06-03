@@ -3,7 +3,11 @@ import { apiGet, apiPostJson, apiPostForm, apiDelete } from './client';
 export const api = {
   getDashboard: () => apiGet('/api/dashboard/'),
   getProviders: () => apiGet('/api/llm-providers/'),
-  generateCases: (payload) => apiPostJson('/generate/', payload),
+  generateCases: (payload) => apiPostJson('/api/generate/', payload),
+  createGenerationJob: (payload) => apiPostJson('/api/generation-jobs/', payload),
+  listGenerationJobs: ({ page = 1, pageSize = 20, status = '' } = {}) =>
+    apiGet(`/api/generation-jobs/?page=${page}&page_size=${pageSize}&status=${encodeURIComponent(status)}`),
+  getGenerationJob: (id) => apiGet(`/api/generation-jobs/${id}/`),
   saveCases: (payload) => apiPostJson('/core/save-test-case/', payload),
 
   listTestCases: (status, page = 1, pageSize = 15) =>

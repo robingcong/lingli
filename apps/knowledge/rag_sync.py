@@ -7,9 +7,15 @@ from typing import Any, Dict, List
 
 from django.utils import timezone
 
-from apps.core.milvus_helper import process_singel_file
 from apps.core.models import KnowledgeChunk, KnowledgeDocument
 from utils.logger_manager import get_logger
+
+
+def process_singel_file(file_path):
+    """Lazy wrapper to avoid importing unstructured during Django startup."""
+    from apps.core.milvus_helper import process_singel_file as _process_singel_file
+
+    return _process_singel_file(file_path)
 
 
 class DjangoKnowledgeDocumentStore:

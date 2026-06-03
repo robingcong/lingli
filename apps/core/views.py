@@ -37,7 +37,6 @@ import os
 import threading
 from datetime import datetime
 import time
-from .milvus_helper import get_embedding_model, init_milvus_collection, process_singel_file
 from langchain.text_splitter import CharacterTextSplitter
 import hashlib
 import numpy as np
@@ -739,6 +738,7 @@ def upload_single_file(request):
                         f.write(chunk)
                 logger.info(f"临时文件保存成功, 文件保存路径: {file_path}")
 
+                from .milvus_helper import process_singel_file
                 chunks = process_singel_file(file_path)  # 获取初始数据和文本切分结果
                 if not chunks:
                     return JsonResponse({'success': False, 'error': '文件没有有效内容可供处理'})

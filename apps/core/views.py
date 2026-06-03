@@ -423,15 +423,15 @@ def knowledge_view(request):
 def add_knowledge(request):
     """添加知识条目"""
     try:
-        data = json.loads(request.body)
-        title = data.get('title')
-        content = data.get('content')
+        data = json.loads(request.body or "{}")
+        title = str(data.get('title') or '').strip()
+        content = str(data.get('content') or '').strip()
         
         if not title or not content:
             return JsonResponse({
                 'success': False,
                 'message': '标题和内容不能为空'
-            })
+            }, status=400)
         
         knowledge_id = knowledge_service.add_knowledge(title, content)
         
@@ -440,11 +440,16 @@ def add_knowledge(request):
             'message': '知识条目添加成功',
             'knowledge_id': knowledge_id
         })
+    except json.JSONDecodeError:
+        return JsonResponse({
+            'success': False,
+            'message': '无效的JSON数据'
+        }, status=400)
     except Exception as e:
         return JsonResponse({
             'success': False,
             'message': str(e)
-        })
+        }, status=500)
 
 def knowledge_list(request):
     """获取知识库条目"""
@@ -454,10 +459,15 @@ def knowledge_list(request):
         items = []
         for item in knowledge_items:
             items.append({
+                'entry_id': f'manual:{item.id}',
+                'entry_type': 'manual',
                 'id': item.id,
                 'title': item.title,
                 'content': item.content,
-                'created_at': item.created_at.isoformat()
+                'summary': item.content[:160],
+                'source': '手动添加',
+                'created_at': item.created_at.isoformat(),
+                'updated_at': item.updated_at.isoformat()
             })
         
         return JsonResponse({

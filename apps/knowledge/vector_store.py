@@ -2,7 +2,9 @@ from pymilvus import connections, Collection, utility, DataType
 from pymilvus import CollectionSchema, FieldSchema
 from typing import List, Dict, Any
 import os
+import hashlib
 from collections import defaultdict
+from datetime import datetime
 from django.conf import settings
 from utils.logger_manager import get_logger
 
@@ -73,7 +75,12 @@ class MilvusVectorStore:
         """添加数据到Milvus集合"""
         logger.info("进入add_data方法")
         collection = Collection(self.collection_name)
-        collection.insert(data)
+        field_names = {field.name for field in collection.schema.fields}
+        insert_data = [
+            self._normalize_insert_row(row, field_names)
+            for row in data
+        ]
+        collection.insert(insert_data)
         collection.flush()
 
     def add_documents(self, documents: List[Dict[str, Any]]):
@@ -187,7 +194,13 @@ class MilvusVectorStore:
     def delete_by_source(self, source: str) -> None:
         collection = Collection(self.collection_name)
         collection.load()
-        collection.delete(expr=self._build_source_expr(source))
+        scalar_fields = {
+            field.name
+            for field in collection.schema.fields
+            if getattr(field, "dtype", None) != DataType.FLOAT_VECTOR
+        }
+        source_field = "source" if "source" in scalar_fields else "source_path"
+        collection.delete(expr=self._build_source_expr(source, source_field))
         collection.flush()
         collection.release()
 
@@ -209,6 +222,43 @@ class MilvusVectorStore:
         collection.release()
         return rows
 
-    def _build_source_expr(self, source: str) -> str:
+    def _build_source_expr(self, source: str, field_name: str = "source") -> str:
         safe_source = str(source).replace("\\", "\\\\").replace("'", "\\'")
-        return f"source == '{safe_source}'"
+        return f"{field_name} == '{safe_source}'"
+
+    def _normalize_insert_row(self, row: Dict[str, Any], field_names: set[str]) -> Dict[str, Any]:
+        """兼容不同 Milvus collection schema 的字段命名。"""
+        normalized = {key: value for key, value in row.items() if key in field_names}
+        content = str(row.get("content") or row.get("text") or row.get("chunk") or "")
+        source = str(
+            row.get("source")
+            or row.get("source_path")
+            or row.get("doc_title")
+            or "manual"
+        )
+        chunk_id = str(row.get("chunk_id") or "")
+        content_hash = hashlib.md5(content.encode("utf-8")).hexdigest()
+        created_at = str(
+            row.get("upload_time")
+            or row.get("created_at")
+            or datetime.now().isoformat()
+        )
+
+        defaults = {
+            "doc_id": hashlib.md5(source.encode("utf-8")).hexdigest(),
+            "chunk_id": chunk_id or f"{content_hash[:12]}-0",
+            "chunk_index": int(row.get("chunk_index") or 0),
+            "content": content,
+            "source_path": source,
+            "doc_title": str(row.get("doc_title") or row.get("title") or os.path.basename(source) or source),
+            "section_path": str(row.get("section_path") or ""),
+            "doc_type": str(row.get("doc_type") or "text"),
+            "version_tag": str(row.get("version_tag") or ""),
+            "content_hash": str(row.get("content_hash") or content_hash),
+            "keywords": str(row.get("keywords") or ""),
+            "created_at": created_at,
+        }
+        for key, value in defaults.items():
+            if key in field_names and key not in normalized:
+                normalized[key] = value
+        return normalized

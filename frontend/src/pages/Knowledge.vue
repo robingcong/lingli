@@ -29,7 +29,58 @@
     </div>
 
     <div class="card">
-      <div class="flex" style="justify-content: space-between; align-items: center;">
+      <div class="section-title-row">
+        <h2>手动添加知识</h2>
+        <span class="muted">提交后写入 MySQL，并同步写入 Milvus 向量库</span>
+      </div>
+      <div class="manual-form">
+        <input v-model="manualTitle" placeholder="请输入知识标题，例如：集群任务规划规则" />
+        <textarea
+          v-model="manualContent"
+          rows="6"
+          placeholder="请输入知识内容。建议写清业务规则、限制条件、异常场景或验收标准。"
+        ></textarea>
+        <div class="form-actions">
+          <button @click="addManualKnowledge" :disabled="addingManual">
+            {{ addingManual ? '添加中...' : '添加知识' }}
+          </button>
+          <button class="secondary" @click="resetManualForm" :disabled="addingManual">清空</button>
+        </div>
+      </div>
+      <div v-if="message" class="notice success">{{ message }}</div>
+      <div v-if="manualError" class="notice error">{{ manualError }}</div>
+    </div>
+
+    <div class="card">
+      <div class="section-title-row">
+        <h2>手动知识条目</h2>
+        <span class="muted">单独展示手动添加的知识，不和 /docs/rag 文档混在一起</span>
+      </div>
+      <table class="table" v-if="manualItems.length">
+        <thead>
+          <tr>
+            <th>标题</th>
+            <th>内容摘要</th>
+            <th>更新时间</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="item in manualItems" :key="item.entry_id || item.id">
+            <td>{{ item.title }}</td>
+            <td>{{ item.summary || item.content }}</td>
+            <td>{{ formatTime(item.updated_at || item.created_at) }}</td>
+            <td>
+              <button class="secondary" @click="openManualDetail(item)">查看内容</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-else class="notice">暂无手动知识条目。</div>
+    </div>
+
+    <div class="card">
+      <div class="section-title-row">
         <h2>知识库内容</h2>
         <span class="muted">仅展示 /docs/rag 下的知识库文档</span>
       </div>
@@ -75,11 +126,15 @@
         <div class="form-grid" style="margin-top: 12px;">
           <div>
             <label>类型</label>
-            <div>{{ selectedItem.entry_type === 'rag_file' ? 'RAG 文档' : selectedItem.entry_type }}</div>
+            <div>{{ entryTypeText(selectedItem) }}</div>
           </div>
-          <div>
+          <div v-if="selectedItem.entry_type !== 'manual'">
             <label>Chunk 数</label>
             <div>{{ selectedItem.chunk_count || 0 }}</div>
+          </div>
+          <div v-else>
+            <label>来源</label>
+            <div>{{ selectedItem.source || '手动添加' }}</div>
           </div>
         </div>
 
@@ -88,7 +143,7 @@
           <pre class="text-block">{{ selectedItem.full_content || selectedItem.content || '暂无内容' }}</pre>
         </div>
 
-        <div style="margin-top: 16px;">
+        <div v-if="selectedItem.entry_type !== 'manual'" style="margin-top: 16px;">
           <label>Chunk 明细</label>
           <div v-if="selectedItem.chunks?.length">
             <details v-for="chunk in selectedItem.chunks" :key="chunk.chunk_id" class="chunk-item">
@@ -111,21 +166,36 @@ import { onMounted, ref } from 'vue';
 import { api } from '../api/endpoints';
 
 const items = ref([]);
+const manualItems = ref([]);
 const searchResults = ref([]);
 const query = ref('');
 const message = ref('');
 const error = ref('');
+const manualError = ref('');
 const searching = ref(false);
+const addingManual = ref(false);
 const selectedItem = ref(null);
 const detailLoading = ref(false);
 const activeEntryId = ref('');
+const manualTitle = ref('');
+const manualContent = ref('');
 
 const formatTime = (value) => (value ? new Date(value).toLocaleString() : '');
+const entryTypeText = (item) => {
+  if (item?.entry_type === 'rag_file') return 'RAG 文档';
+  if (item?.entry_type === 'manual') return '手动知识';
+  return item?.entry_type || '-';
+};
 
 async function load() {
   try {
-    const data = await api.listKnowledgeLibrary();
-    items.value = data.items || [];
+    error.value = '';
+    const [libraryData, manualData] = await Promise.all([
+      api.listKnowledgeLibrary(),
+      api.listKnowledge()
+    ]);
+    items.value = libraryData.items || [];
+    manualItems.value = manualData.knowledge_items || [];
   } catch (e) {
     error.value = e.message || '加载失败。';
   }
@@ -138,10 +208,50 @@ async function search() {
     const data = await api.searchKnowledge({ query: query.value });
     searchResults.value = data.results || [];
   } catch (e) {
-    message.value = e.message || '搜索失败。';
+    error.value = e.message || '搜索失败。';
   } finally {
     searching.value = false;
   }
+}
+
+function resetManualForm() {
+  manualTitle.value = '';
+  manualContent.value = '';
+  manualError.value = '';
+  message.value = '';
+}
+
+async function addManualKnowledge() {
+  const title = manualTitle.value.trim();
+  const content = manualContent.value.trim();
+  manualError.value = '';
+  message.value = '';
+  if (!title || !content) {
+    manualError.value = '标题和内容不能为空。';
+    return;
+  }
+  addingManual.value = true;
+  try {
+    await api.addKnowledge({ title, content });
+    manualTitle.value = '';
+    manualContent.value = '';
+    message.value = '知识条目添加成功，已写入知识库。';
+    await load();
+  } catch (e) {
+    manualError.value = e.message || '添加失败。';
+  } finally {
+    addingManual.value = false;
+  }
+}
+
+function openManualDetail(item) {
+  selectedItem.value = {
+    ...item,
+    entry_type: 'manual',
+    source: item.source || '手动添加',
+    full_content: item.content,
+    chunks: []
+  };
 }
 
 async function openDetail(item) {
@@ -161,6 +271,35 @@ onMounted(load);
 </script>
 
 <style scoped>
+.section-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.section-title-row h2 {
+  margin-bottom: 0;
+}
+
+.manual-form {
+  display: grid;
+  gap: 10px;
+}
+
+.form-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.notice.success {
+  background: var(--panel-soft);
+  color: var(--success);
+}
+
 .muted {
   color: var(--muted-color, #666);
   font-size: 12px;
@@ -188,5 +327,12 @@ onMounted(load);
   justify-content: space-between;
   gap: 12px;
   cursor: pointer;
+}
+
+@media (max-width: 720px) {
+  .section-title-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
 }
 </style>

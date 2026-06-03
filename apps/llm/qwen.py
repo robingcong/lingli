@@ -9,7 +9,7 @@ class QwenChatModel(ChatOpenAI):
         self,
         api_key: str = None,
         api_base: str = None,
-        model: str = "qwen-max",
+        model: str = "qwen3.7-max",
         **kwargs,
     ):
         api_base = api_base or os.getenv("QWEN_API_BASE", "https://dashscope.aliyuncs.com/compatible-mode/v1")

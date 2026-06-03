@@ -19,7 +19,10 @@ urlpatterns = [
 
     path('api/dashboard/', api_views.dashboard, name='api_dashboard'),
     path('api/llm-providers/', api_views.llm_providers, name='api_llm_providers'),
+    path('api/generate/', csrf_exempt(views.generate), name='api_generate'),
     path('api/test-cases-list/', api_views.test_cases_list, name='api_test_cases_list'),
+    path('api/generation-jobs/', csrf_exempt(api_views.generation_jobs), name='api_generation_jobs'),
+    path('api/generation-jobs/<int:job_id>/', api_views.generation_job_detail, name='api_generation_job_detail'),
     path('api/plane-work-items/', csrf_exempt(api_views.plane_work_items), name='api_plane_work_items'),
     path('api/plane-one-click-generate/', csrf_exempt(api_views.plane_one_click_generate), name='api_plane_one_click_generate'),
 

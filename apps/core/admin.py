@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import TestCase, TestCaseReview, KnowledgeBase, PlaneWorkItem
+from .models import TestCase, TestCaseGenerationJob, TestCaseReview, KnowledgeBase, PlaneWorkItem
 
 @admin.register(TestCase)
 class TestCaseAdmin(admin.ModelAdmin):
@@ -29,3 +29,11 @@ class PlaneWorkItemAdmin(admin.ModelAdmin):
     list_filter = ('project_name', 'updated_at')
     search_fields = ('project_name', 'work_item_id', 'work_item_name', 'work_item_content')
     readonly_fields = ('created_at', 'updated_at')
+
+
+@admin.register(TestCaseGenerationJob)
+class TestCaseGenerationJobAdmin(admin.ModelAdmin):
+    list_display = ('id', 'source_type', 'source_title', 'status', 'progress', 'llm_provider', 'created_at')
+    list_filter = ('source_type', 'status', 'llm_provider', 'created_at')
+    search_fields = ('source_title', 'requirements', 'message', 'error_message')
+    readonly_fields = ('created_at', 'updated_at', 'started_at', 'finished_at')

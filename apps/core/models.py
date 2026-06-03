@@ -267,3 +267,62 @@ class PlaneWorkItem(models.Model):
     class Meta:
         verbose_name = "Plane工作项"
         verbose_name_plural = "Plane工作项"
+
+
+class TestCaseGenerationJob(models.Model):
+    """测试用例后台生成任务。"""
+
+    SOURCE_CHOICES = [
+        ("requirement", "需求生成"),
+        ("plane", "Plane 工作项生成"),
+    ]
+
+    STATUS_CHOICES = [
+        ("queued", "排队中"),
+        ("running", "生成中"),
+        ("saving", "保存中"),
+        ("completed", "已完成"),
+        ("failed", "失败"),
+        ("cancelled", "已取消"),
+    ]
+
+    source_type = models.CharField(
+        max_length=32,
+        choices=SOURCE_CHOICES,
+        db_index=True,
+        verbose_name="任务来源",
+    )
+    source_id = models.CharField(max_length=128, blank=True, db_index=True, verbose_name="来源ID")
+    source_title = models.CharField(max_length=500, blank=True, verbose_name="来源标题")
+    requirements = models.TextField(verbose_name="需求内容")
+    llm_provider = models.CharField(max_length=50, blank=True, verbose_name="请求模型")
+    effective_provider = models.CharField(max_length=50, blank=True, verbose_name="实际模型")
+    case_count = models.IntegerField(default=0, verbose_name="目标用例数")
+    config_json = models.TextField(default="{}", verbose_name="生成配置")
+    status = models.CharField(
+        max_length=32,
+        choices=STATUS_CHOICES,
+        default="queued",
+        db_index=True,
+        verbose_name="任务状态",
+    )
+    progress = models.IntegerField(default=0, verbose_name="进度")
+    stage = models.CharField(max_length=100, blank=True, verbose_name="当前阶段")
+    message = models.TextField(blank=True, verbose_name="状态消息")
+    error_message = models.TextField(blank=True, verbose_name="错误信息")
+    result_json = models.TextField(blank=True, verbose_name="生成结果")
+    generation_meta_json = models.TextField(blank=True, verbose_name="Agent 执行信息")
+    test_case_ids_json = models.TextField(blank=True, verbose_name="保存的用例ID")
+    saved_count = models.IntegerField(default=0, verbose_name="已保存用例数")
+    started_at = models.DateTimeField(null=True, blank=True, verbose_name="开始时间")
+    finished_at = models.DateTimeField(null=True, blank=True, verbose_name="完成时间")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
+
+    def __str__(self):
+        return f"{self.get_source_type_display()} - {self.source_title or self.id}"
+
+    class Meta:
+        db_table = "test_case_generation_job"
+        verbose_name = "测试用例生成任务"
+        verbose_name_plural = "测试用例生成任务"

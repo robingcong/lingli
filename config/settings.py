@@ -135,7 +135,7 @@ STATICFILES_DIRS = []
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 LLM_PROVIDERS = {
-    "default_provider": os.getenv("DEFAULT_LLM_PROVIDER", "qwen"),
+    "default_provider": os.getenv("DEFAULT_LLM_PROVIDER", "kimi"),
     "deepseek": {
         "name": "DeepSeek",
         "model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
@@ -145,8 +145,8 @@ LLM_PROVIDERS = {
         "api_key": os.getenv("DEEPSEEK_API_KEY", ""),
     },
     "qwen": {
-        "name": "Qwen",
-        "model": os.getenv("QWEN_MODEL", "qwen-max"),
+        "name": "Qwen 3.7 Max",
+        "model": os.getenv("QWEN_MODEL", "qwen3.7-max"),
         "api_base": os.getenv("QWEN_API_BASE", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
         "temperature": env_float("QWEN_TEMPERATURE", 1.0),
         "max_tokens": env_int("QWEN_MAX_TOKENS", 8192),
@@ -171,14 +171,17 @@ LLM_PROVIDERS = {
 }
 
 TEST_CASE_GENERATION_CONFIG = {
+    "fast_mode": env_bool("TEST_CASE_FAST_MODE", True),
+    "fast_single_call": env_bool("TEST_CASE_FAST_SINGLE_CALL", True),
+    "enable_llm_review": env_bool("TEST_CASE_ENABLE_LLM_REVIEW", False),
     "generation_temperature": env_float("TEST_CASE_GENERATION_TEMPERATURE", 0.3),
     "review_temperature": env_float("TEST_CASE_REVIEW_TEMPERATURE", 0.2),
     "default_target_count": env_int("TEST_CASE_DEFAULT_TARGET_COUNT", 8),
-    "candidate_multiplier": env_int("TEST_CASE_CANDIDATE_MULTIPLIER", 2),
-    "minimum_candidate_count": env_int("TEST_CASE_MINIMUM_CANDIDATE_COUNT", 8),
+    "candidate_multiplier": env_int("TEST_CASE_CANDIDATE_MULTIPLIER", 1),
+    "minimum_candidate_count": env_int("TEST_CASE_MINIMUM_CANDIDATE_COUNT", 6),
     "min_review_score": env_int("TEST_CASE_MIN_REVIEW_SCORE", 7),
     "max_supplement_rounds": env_int("TEST_CASE_MAX_SUPPLEMENT_ROUNDS", 2),
-    "max_total_rounds": env_int("TEST_CASE_MAX_TOTAL_ROUNDS", 3),
+    "max_total_rounds": env_int("TEST_CASE_MAX_TOTAL_ROUNDS", 1),
     "dedupe_similarity_threshold": env_float("TEST_CASE_DEDUPE_SIMILARITY", 0.72),
     "keyword_overlap_threshold": env_float("TEST_CASE_KEYWORD_OVERLAP", 0.6),
 }

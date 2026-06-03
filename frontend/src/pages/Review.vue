@@ -1,4 +1,4 @@
-﻿<template>
+<template>
   <div>
     <div class="card">
       <h2>用例评审</h2>
@@ -37,7 +37,7 @@
       <table class="table" v-if="groupedItems.length">
         <thead>
           <tr>
-            <th><input type="checkbox" v-model="selectAll" /></th>
+            <th><input type="checkbox" :checked="allVisibleSelected" @change="toggleAllVisible($event.target.checked)" /></th>
             <th>需求（父）/ 用例（子）</th>
             <th>状态</th>
             <th>快速更新</th>
@@ -71,6 +71,10 @@
               <td>
                 <div class="case-title"><strong>#{{ item.id }}</strong> {{ item.title || '未命名用例' }}</div>
                 <div class="case-desc">{{ item.description }}</div>
+                <div class="case-meta">
+                  <span>{{ item.llm_provider || '未知模型' }}</span>
+                  <span v-if="item.ai_review?.score">AI 评分 {{ item.ai_review.score }}</span>
+                </div>
               </td>
               <td><span class="badge" :class="statusClass(item.status)">{{ statusText(item.status) }}</span></td>
               <td>
@@ -121,7 +125,6 @@ const pageSize = ref(15);
 const totalPages = ref(1);
 const items = ref([]);
 const selectedIds = ref([]);
-const selectAll = ref(false);
 const copied = ref([]);
 const message = ref('');
 const error = ref('');
@@ -145,10 +148,10 @@ const statusText = (value) => {
 const filteredItems = computed(() => {
   const kw = keyword.value.trim().toLowerCase();
   if (!kw) return items.value;
-  return items.value.filter((i) => {
-    const req = (i.requirements || '').toLowerCase();
-    const title = (i.title || '').toLowerCase();
-    const desc = (i.description || '').toLowerCase();
+  return items.value.filter((item) => {
+    const req = (item.requirements || '').toLowerCase();
+    const title = (item.title || '').toLowerCase();
+    const desc = (item.description || '').toLowerCase();
     return req.includes(kw) || title.includes(kw) || desc.includes(kw);
   });
 });
@@ -167,10 +170,10 @@ function extractRequirementMeta(requirements, fallback = '') {
   const matchId = req.match(/【工作项ID】([^\n\r]+)/);
   const matchContent = req.match(/【工作项内容】([\s\S]*)$/);
 
-  const parentName = (matchTitle?.[1] || '').trim() || req;
+  const parentName = (matchTitle?.[1] || '').trim() || req.split(/\r?\n/)[0] || req;
   const parentId = (matchId?.[1] || '').trim();
 
-  const contentRaw = (matchContent?.[1] || '').trim();
+  const contentRaw = (matchContent?.[1] || req).trim();
   const childName = contentRaw
     ? contentRaw
       .replace(/<[^>]+>/g, ' ')
@@ -203,7 +206,11 @@ const groupedItems = computed(() => {
   return Array.from(groups.values());
 });
 
-const allVisibleIds = computed(() => filteredItems.value.map((i) => i.id));
+const allVisibleIds = computed(() => filteredItems.value.map((item) => item.id));
+const allVisibleSelected = computed(() => (
+  allVisibleIds.value.length > 0
+  && allVisibleIds.value.every((id) => selectedIds.value.includes(id))
+));
 
 function isGroupExpanded(group) {
   return groupExpanded.value[group.groupKey] !== false;
@@ -216,27 +223,27 @@ function toggleGroup(group) {
 
 function expandAllGroups() {
   const next = {};
-  for (const g of groupedItems.value) {
-    next[g.groupKey] = true;
+  for (const group of groupedItems.value) {
+    next[group.groupKey] = true;
   }
   groupExpanded.value = next;
 }
 
 function collapseAllGroups() {
   const next = {};
-  for (const g of groupedItems.value) {
-    next[g.groupKey] = false;
+  for (const group of groupedItems.value) {
+    next[group.groupKey] = false;
   }
   groupExpanded.value = next;
 }
 
 function isGroupChecked(group) {
   if (!group.children.length) return false;
-  return group.children.every((c) => selectedIds.value.includes(c.id));
+  return group.children.every((child) => selectedIds.value.includes(child.id));
 }
 
 function toggleGroupSelection(group, checked) {
-  const ids = group.children.map((c) => c.id);
+  const ids = group.children.map((child) => child.id);
   if (checked) {
     selectedIds.value = Array.from(new Set([...selectedIds.value, ...ids]));
   } else {
@@ -245,15 +252,18 @@ function toggleGroupSelection(group, checked) {
   }
 }
 
+function toggleAllVisible(checked) {
+  selectedIds.value = checked ? [...allVisibleIds.value] : [];
+}
+
 async function load() {
   error.value = '';
   message.value = '';
   try {
     const data = await api.listTestCases(status.value, page.value, pageSize.value);
-    items.value = (data.items || []).map((i) => ({ ...i, _next_status: i.status }));
+    items.value = (data.items || []).map((item) => ({ ...item, _next_status: item.status }));
     totalPages.value = data.total_pages || 1;
     selectedIds.value = [];
-    selectAll.value = false;
   } catch (e) {
     error.value = e.message || '加载失败。';
   }
@@ -320,30 +330,10 @@ async function updateStatus(item) {
   }
 }
 
-watch(selectAll, (value) => {
-  if (value) {
-    selectedIds.value = [...allVisibleIds.value];
-  } else {
-    selectedIds.value = [];
-  }
-});
-
-watch(selectedIds, (value) => {
-  if (!allVisibleIds.value.length) {
-    selectAll.value = false;
-    return;
-  }
-  if (value.length !== allVisibleIds.value.length) {
-    selectAll.value = false;
-  } else {
-    selectAll.value = true;
-  }
-});
-
 watch(groupedItems, (groups) => {
   const next = {};
-  for (const g of groups) {
-    next[g.groupKey] = groupExpanded.value[g.groupKey] !== false;
+  for (const group of groups) {
+    next[group.groupKey] = groupExpanded.value[group.groupKey] !== false;
   }
   groupExpanded.value = next;
 }, { immediate: true });
@@ -353,7 +343,7 @@ onMounted(load);
 
 <style scoped>
 .group-row td {
-  background: #f8f9fc;
+  background: var(--panel-soft);
 }
 
 .group-head {
@@ -363,14 +353,14 @@ onMounted(load);
 }
 
 .group-count {
-  color: #3b5ccc;
-  font-weight: 500;
+  color: var(--muted);
+  font-weight: 600;
 }
 
 .group-title {
   margin-top: 8px;
-  word-break: break-all;
-  color: #222;
+  word-break: break-word;
+  color: var(--text);
   font-size: 16px;
   font-weight: 700;
 }
@@ -379,8 +369,9 @@ onMounted(load);
   margin-top: 6px;
   margin-left: 20px;
   font-size: 13px;
-  color: #56607a;
+  color: var(--muted);
   line-height: 1.5;
+  word-break: break-word;
 }
 
 .case-title {
@@ -391,7 +382,17 @@ onMounted(load);
 .case-desc {
   margin-top: 4px;
   margin-left: 16px;
-  color: #666;
+  color: var(--muted);
   font-size: 13px;
+  line-height: 1.5;
+}
+
+.case-meta {
+  display: flex;
+  gap: 10px;
+  margin-top: 6px;
+  margin-left: 16px;
+  color: var(--muted);
+  font-size: 12px;
 }
 </style>

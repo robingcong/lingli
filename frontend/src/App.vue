@@ -3,7 +3,10 @@
     <aside class="sidebar">
       <div class="brand">
         <h1>AiCase</h1>
-        <button class="theme-toggle" @click="cycleTheme">主题：{{ themeLabel }}</button>
+        <button class="theme-toggle" @click="toggleTheme" :aria-label="`切换主题，当前为${themeLabel}`">
+          <span class="theme-icon" aria-hidden="true">{{ themeIcon }}</span>
+          <span>{{ themeLabel }}</span>
+        </button>
       </div>
       <nav class="nav">
         <RouterLink to="/">看板</RouterLink>
@@ -23,36 +26,44 @@
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { RouterLink, RouterView } from 'vue-router';
 
-const themes = ['default', 'ocean', 'sunset'];
+const themes = ['light', 'dark'];
 const themeNameMap = {
-  default: '默认',
-  ocean: '海洋',
-  sunset: '暖阳'
+  light: '白色',
+  dark: '黑色'
 };
-const themeLabel = ref(themeNameMap.default);
+const themeIconMap = {
+  light: '☀️',
+  dark: '🌙'
+};
+const currentTheme = ref('light');
+const themeLabel = computed(() => themeNameMap[currentTheme.value]);
+const themeIcon = computed(() => themeIconMap[currentTheme.value]);
 
-function applyTheme(value) {
-  if (value === 'default') {
-    document.documentElement.removeAttribute('data-theme');
-  } else {
-    document.documentElement.setAttribute('data-theme', value);
-  }
-  themeLabel.value = themeNameMap[value] || value;
-  localStorage.setItem('theme', value);
+function normalizeTheme(value) {
+  return themes.includes(value) ? value : 'light';
 }
 
-function cycleTheme() {
-  const current = localStorage.getItem('theme') || 'default';
-  const idx = themes.indexOf(current);
-  const next = themes[(idx + 1) % themes.length];
+function applyTheme(value) {
+  const nextTheme = normalizeTheme(value);
+  if (nextTheme === 'light') {
+    document.documentElement.removeAttribute('data-theme');
+  } else {
+    document.documentElement.setAttribute('data-theme', nextTheme);
+  }
+  currentTheme.value = nextTheme;
+  localStorage.setItem('theme', nextTheme);
+}
+
+function toggleTheme() {
+  const next = currentTheme.value === 'light' ? 'dark' : 'light';
   applyTheme(next);
 }
 
 onMounted(() => {
-  const saved = localStorage.getItem('theme') || 'default';
+  const saved = localStorage.getItem('theme') || 'light';
   applyTheme(saved);
 });
 </script>

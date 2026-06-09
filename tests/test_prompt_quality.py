@@ -42,7 +42,7 @@ class PromptQualityTests(unittest.TestCase):
         self.assertIn("兼容性", merged)
         self.assertIn("安全", merged)
         self.assertIn("稳定性", merged)
-        self.assertIn("至少参考目标 5 条", merged)
+        self.assertIn("数量不设上限", merged)
         self.assertIn("覆盖不足应继续补充", merged)
 
     def test_test_case_generator_strengthens_system_function_content_prompts(self):

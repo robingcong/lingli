@@ -135,7 +135,7 @@
           </div>
           <div class="trace-metric">
             <span>生成数量</span>
-            <strong>{{ generationMeta.returned_count || testCases.length }} / {{ generationMeta.target_count || '-' }}</strong>
+            <strong>{{ generationMeta.returned_count || testCases.length }}</strong>
           </div>
           <div class="trace-metric">
             <span>候选/保留</span>

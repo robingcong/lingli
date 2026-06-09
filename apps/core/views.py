@@ -23,6 +23,10 @@ from ..agents.prompts import APITestCaseGeneratorPrompt
 from ..agents.progress_registry import get_progress as get_task_progress
 from ..knowledge.service import KnowledgeService
 from .title_utils import build_test_case_title
+from .automation.serializers import (
+    serialize_latest_automation_run,
+    serialize_recent_automation_runs,
+)
 
 from django.conf import settings
 from apps.llm import LLMServiceFactory
@@ -857,7 +861,9 @@ def get_test_case(request, test_case_id):
                 'recommendation': ai_review.recommendation,
                 'raw_result': ai_review.raw_result,
                 'updated_at': ai_review.updated_at.isoformat()
-            } if ai_review else None
+            } if ai_review else None,
+            'latest_automation_run': serialize_latest_automation_run("test_case", test_case.id),
+            'automation_runs': serialize_recent_automation_runs("test_case", test_case.id),
         })
     except TestCase.DoesNotExist:
         return JsonResponse({'error': '测试用例不存在'}, status=404)
@@ -1573,7 +1579,9 @@ def api_case_generation_detail(request, generation_id: int):
             'selected_api_count': item.selected_api_count,
             'task_id': item.task_id,
             'result_json': item.result_json,
-            'created_at': item.created_at.isoformat()
+            'created_at': item.created_at.isoformat(),
+            'latest_automation_run': serialize_latest_automation_run("api_case_generation", item.id),
+            'automation_runs': serialize_recent_automation_runs("api_case_generation", item.id),
         }
     })
 

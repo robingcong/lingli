@@ -326,3 +326,47 @@ class TestCaseGenerationJob(models.Model):
         db_table = "test_case_generation_job"
         verbose_name = "测试用例生成任务"
         verbose_name_plural = "测试用例生成任务"
+
+
+class AutomationRun(models.Model):
+    """自动化执行记录，关联 LingLi 生成或评审后的用例。"""
+
+    STATUS_CHOICES = [
+        ("passed", "通过"),
+        ("failed", "失败"),
+        ("error", "执行异常"),
+    ]
+
+    RUNNER_CHOICES = [
+        ("api_requests", "API Requests"),
+        ("playwright", "Playwright"),
+    ]
+
+    SOURCE_CHOICES = [
+        ("test_case", "测试用例"),
+        ("api_case_generation", "接口用例生成记录"),
+    ]
+
+    source_type = models.CharField(max_length=64, choices=SOURCE_CHOICES, db_index=True)
+    source_id = models.CharField(max_length=128, db_index=True)
+    runner_type = models.CharField(max_length=64, choices=RUNNER_CHOICES, db_index=True)
+    status = models.CharField(max_length=32, choices=STATUS_CHOICES, db_index=True)
+    passed = models.BooleanField(default=False)
+    duration_ms = models.IntegerField(default=0)
+    spec_json = models.TextField(default="{}", verbose_name="AutomationSpec")
+    script_text = models.TextField(blank=True, verbose_name="执行脚本")
+    error_message = models.TextField(blank=True, verbose_name="错误信息")
+    evidence_json = models.TextField(default="{}", verbose_name="执行证据")
+    analysis_json = models.TextField(default="{}", verbose_name="失败归因")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
+    started_at = models.DateTimeField(null=True, blank=True, verbose_name="开始时间")
+    finished_at = models.DateTimeField(null=True, blank=True, verbose_name="结束时间")
+
+    def __str__(self):
+        return f"{self.runner_type} {self.source_type}:{self.source_id} {self.status}"
+
+    class Meta:
+        db_table = "automation_run"
+        verbose_name = "自动化执行记录"
+        verbose_name_plural = "自动化执行记录"

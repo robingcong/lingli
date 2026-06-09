@@ -23,6 +23,12 @@ urlpatterns = [
     path('api/test-cases-list/', api_views.test_cases_list, name='api_test_cases_list'),
     path('api/generation-jobs/', csrf_exempt(api_views.generation_jobs), name='api_generation_jobs'),
     path('api/generation-jobs/<int:job_id>/', api_views.generation_job_detail, name='api_generation_job_detail'),
+    path('api/automation/test-case/<int:test_case_id>/script/', csrf_exempt(api_views.test_case_automation_script), name='api_test_case_automation_script'),
+    path('api/automation/test-case/<int:test_case_id>/run/', csrf_exempt(api_views.test_case_automation_run), name='api_test_case_automation_run'),
+    path('api/automation/test-case/<int:test_case_id>/runs/', api_views.test_case_automation_runs, name='api_test_case_automation_runs'),
+    path('api/automation/api-case-generations/<int:generation_id>/run/', csrf_exempt(api_views.api_case_generation_automation_run), name='api_api_case_generation_automation_run'),
+    path('api/automation/api-case-generations/<int:generation_id>/runs/', api_views.api_case_generation_automation_runs, name='api_api_case_generation_automation_runs'),
+    path('api/automation/ui-test-cases/', api_views.ui_automation_test_cases, name='api_ui_automation_test_cases'),
     path('api/plane-work-items/', csrf_exempt(api_views.plane_work_items), name='api_plane_work_items'),
     path('api/plane-one-click-generate/', csrf_exempt(api_views.plane_one_click_generate), name='api_plane_one_click_generate'),
 

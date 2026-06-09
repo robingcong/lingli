@@ -16,6 +16,7 @@
         <RouterLink to="/upload">知识库上传</RouterLink>
         <RouterLink to="/analyser">PRD 分析</RouterLink>
         <RouterLink to="/api-case-generate">接口用例生成</RouterLink>
+        <RouterLink to="/ui-automation">UI 自动化管理</RouterLink>
         <RouterLink to="/knowledge">知识库管理</RouterLink>
       </nav>
     </aside>

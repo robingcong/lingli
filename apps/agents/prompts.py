@@ -210,11 +210,7 @@ class TestCaseGeneratorPrompt:
             case_categories = "所有适用的测试类型"
             
         knowledge_prompt = self._format_knowledge_prompt(knowledge_context)
-        quantity_instruction = (
-            "，数量不设上限，请尽可能多生成 case，并持续补齐所有覆盖维度"
-            if case_count <= 0
-            else f"（至少参考目标 {case_count} 条；如果覆盖维度不足应继续补充，优先生成更多 case 以补齐场景覆盖）"
-        )
+        quantity_instruction = "，数量不设上限，请尽可能多生成 case，并持续补齐所有覆盖维度"
         
         messages = self.prompt_template.format_messages(
             requirements=requirements,

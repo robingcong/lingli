@@ -9,6 +9,16 @@ export const api = {
     apiGet(`/api/generation-jobs/?page=${page}&page_size=${pageSize}&status=${encodeURIComponent(status)}`),
   getGenerationJob: (id) => apiGet(`/api/generation-jobs/${id}/`),
   saveCases: (payload) => apiPostJson('/core/save-test-case/', payload),
+  generateAutomationScript: (id, payload) =>
+    apiPostJson(`/api/automation/test-case/${id}/script/`, payload),
+  runTestCaseAutomation: (id, payload) =>
+    apiPostJson(`/api/automation/test-case/${id}/run/`, payload),
+  runApiCaseGenerationAutomation: (id, payload) =>
+    apiPostJson(`/api/automation/api-case-generations/${id}/run/`, payload),
+  listUiAutomationTestCases: ({ page = 1, pageSize = 15, status = 'approved', automationStatus = 'all', keyword = '' } = {}) =>
+    apiGet(
+      `/api/automation/ui-test-cases/?page=${page}&page_size=${pageSize}&status=${encodeURIComponent(status)}&automation_status=${encodeURIComponent(automationStatus)}&keyword=${encodeURIComponent(keyword)}`
+    ),
 
   listTestCases: (status, page = 1, pageSize = 15) =>
     apiGet(`/api/test-cases-list/?status=${encodeURIComponent(status)}&page=${page}&page_size=${pageSize}`),

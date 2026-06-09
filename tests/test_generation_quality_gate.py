@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import threading
 import time
 import unittest
@@ -13,7 +14,7 @@ django.setup()
 from django.conf import settings
 from django.test import RequestFactory
 
-from apps.agents.generator import TestCaseGeneratorAgent
+from apps.agents.generator import RequirementDecomposerAgent, TestCaseGeneratorAgent
 from apps.core.views import generate
 
 
@@ -83,6 +84,66 @@ class _ParallelAwareLLM:
                     "expected_results": ["登录成功", "进入首页"],
                 }
             ]
+        return SimpleNamespace(content=json.dumps(payload, ensure_ascii=False))
+
+
+class _FeatureAwareParallelLLM:
+    def __init__(self):
+        self.calls = []
+        self._lock = threading.Lock()
+        self.active_calls = 0
+        self.max_active_calls = 0
+
+    def invoke(self, messages):
+        merged = "\n".join(getattr(m, "content", str(m)) for m in messages)
+        focus_match = re.search(r"需求功能点：([^\n]+)", merged)
+        focus_text = focus_match.group(1) if focus_match else merged
+        with self._lock:
+            self.calls.append(merged)
+            self.active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self.active_calls)
+        time.sleep(0.05)
+        with self._lock:
+            self.active_calls -= 1
+
+        if "设备列表" in focus_text:
+            title = "从设备列表选择多架异构无人机"
+        elif "执行任务" in focus_text:
+            title = "多架异构无人机执行任务"
+        else:
+            title = "集群任务规划创建"
+
+        payload = [
+            {
+                "description": title,
+                "test_steps": [f"进入{title}入口", "提交操作"],
+                "expected_results": [f"{title}入口展示正确", "系统保存并回显结果"],
+            }
+        ]
+        return SimpleNamespace(content=json.dumps(payload, ensure_ascii=False))
+
+
+class _MultiCaseFeatureLLM:
+    def __init__(self):
+        self.calls = []
+
+    def invoke(self, messages):
+        merged = "\n".join(getattr(m, "content", str(m)) for m in messages)
+        focus_match = re.search(r"需求功能点：([^\n]+)", merged)
+        focus_text = focus_match.group(1) if focus_match else "需求核心功能"
+        self.calls.append(merged)
+        payload = [
+            {
+                "description": f"{focus_text}主流程",
+                "test_steps": ["进入功能入口", "提交有效数据"],
+                "expected_results": ["功能入口展示正确", "提交成功并回显"],
+            },
+            {
+                "description": f"{focus_text}异常提示",
+                "test_steps": ["进入功能入口", "提交无效数据"],
+                "expected_results": ["功能入口展示正确", "提示数据不合法"],
+            },
+        ]
         return SimpleNamespace(content=json.dumps(payload, ensure_ascii=False))
 
 
@@ -376,6 +437,19 @@ class GeneratorQualityGateTests(unittest.TestCase):
         self.assertIn("强度", prompt_text)
         self.assertIn("尽量拆出更多功能点", prompt_text)
 
+    def test_requirement_decomposer_extracts_feature_units_from_system_requirement(self):
+        decomposer = RequirementDecomposerAgent()
+
+        features = decomposer.decompose(
+            "集群任务规划：系统支持集群任务规划，支持从设备列表选择多架异构无人机执行任务。"
+        )
+
+        titles = [feature.title for feature in features]
+        self.assertGreaterEqual(len(features), 3)
+        self.assertIn("集群任务规划", titles)
+        self.assertIn("从设备列表选择多架异构无人机", titles)
+        self.assertIn("多架异构无人机执行任务", titles)
+
     def test_functional_only_generation_does_not_force_nonfunctional_coverages_by_count(self):
         agent = TestCaseGeneratorAgent(
             llm_service=SimpleNamespace(),
@@ -438,6 +512,67 @@ class GeneratorQualityGateTests(unittest.TestCase):
         self.assertEqual(trace["metadata"]["qualified_count"], 1)
         self.assertEqual(trace["metadata"]["retained_count"], 1)
         self.assertEqual(len(knowledge_service.calls), 1)
+
+    def test_fast_generation_decomposes_requirement_and_runs_feature_workers_in_parallel(self):
+        llm = _FeatureAwareParallelLLM()
+        agent = TestCaseGeneratorAgent(
+            llm_service=llm,
+            knowledge_service=self.knowledge_service,
+            case_design_methods=["等价类划分"],
+            case_categories=["功能测试"],
+            case_count=3,
+            reviewer_agent=_FakeReviewer({}),
+            quality_config={
+                "default_target_count": 3,
+                "fast_mode": True,
+                "fast_single_call": True,
+                "enable_llm_review": False,
+                "candidate_multiplier": 1,
+                "minimum_candidate_count": 3,
+                "max_total_rounds": 1,
+            },
+        )
+
+        cases = agent.generate("集群任务规划：系统支持集群任务规划，支持从设备列表选择多架异构无人机执行任务。")
+
+        self.assertEqual(len(cases), 3)
+        self.assertGreaterEqual(llm.max_active_calls, 2)
+        self.assertGreaterEqual(len(llm.calls), 2)
+        self.assertTrue(any("需求功能点" in call for call in llm.calls))
+        descriptions = {case["description"] for case in cases}
+        self.assertIn("集群任务规划创建", descriptions)
+        self.assertIn("从设备列表选择多架异构无人机", descriptions)
+        self.assertIn("多架异构无人机执行任务", descriptions)
+        step_names = [step["name"] for step in agent.last_run_trace["steps"]]
+        self.assertIn("requirement_decomposition", step_names)
+        self.assertIn("generation_planning", step_names)
+        self.assertIn("parallel_generation", step_names)
+
+    def test_generation_returns_all_model_cases_without_trimming_to_case_count(self):
+        llm = _MultiCaseFeatureLLM()
+        agent = TestCaseGeneratorAgent(
+            llm_service=llm,
+            knowledge_service=self.knowledge_service,
+            case_design_methods=["等价类划分"],
+            case_categories=["功能测试"],
+            case_count=2,
+            reviewer_agent=_FakeReviewer({}),
+            quality_config={
+                "default_target_count": 2,
+                "fast_mode": True,
+                "fast_single_call": True,
+                "enable_llm_review": False,
+                "candidate_multiplier": 1,
+                "minimum_candidate_count": 2,
+                "max_total_rounds": 1,
+            },
+        )
+
+        cases = agent.generate("集群任务规划：支持任务创建，支持从设备列表选择多架无人机。")
+
+        self.assertGreater(len(cases), 2)
+        self.assertEqual(len(cases), 6)
+        self.assertEqual(agent.last_run_trace["returned_count"], 6)
 
     def test_generate_retries_to_fill_shortfall_after_dedupe_and_quality_filter(self):
         llm = _FakeLLM([
@@ -512,9 +647,9 @@ class GeneratorQualityGateTests(unittest.TestCase):
 
         cases = agent.generate("用户登录")
 
-        self.assertEqual(len(cases), 4)
+        self.assertEqual(len(cases), 5)
         self.assertEqual(len(llm.calls), 2)
-        self.assertEqual(len({case["description"] for case in cases}), 4)
+        self.assertEqual(len({case["description"] for case in cases}), 5)
         self.assertNotIn("登录性能响应时间", [case["description"] for case in cases])
         self.assertTrue(any("functional-case-generator" in call for call in llm.calls))
         self.assertTrue(any("nonfunctional-case-generator" in call for call in llm.calls))
@@ -688,7 +823,7 @@ class GeneratorQualityGateTests(unittest.TestCase):
 
         cases = agent.generate("用户登录")
 
-        self.assertEqual(len(cases), 3)
+        self.assertEqual(len(cases), 4)
         self.assertEqual(len(knowledge_service.calls), 1)
         self.assertEqual(knowledge_service.calls[0]["query"], "用户登录")
 

@@ -93,6 +93,66 @@
         <pre>{{ reviewResult }}</pre>
       </div>
     </div>
+
+    <div class="card" v-if="testCase">
+      <h2>UI 冒烟自动化</h2>
+      <div class="form-grid">
+        <div>
+          <label>Base URL</label>
+          <input v-model="automationBaseUrl" />
+        </div>
+        <div>
+          <label>登录信息</label>
+          <label class="check-line">
+            <input type="checkbox" v-model="automationLoginEnabled" />
+            <span>执行前登录</span>
+          </label>
+        </div>
+        <div>
+          <label>人工确认</label>
+          <label class="check-line">
+            <input type="checkbox" v-model="automationConfirmed" />
+            <span>脚本已确认</span>
+          </label>
+        </div>
+      </div>
+      <div v-if="automationLoginEnabled" class="form-grid login-grid">
+        <div>
+          <label>登录地址</label>
+          <input v-model="automationLoginUrl" placeholder="/login" />
+        </div>
+        <div>
+          <label>账号</label>
+          <input v-model="automationLoginUsername" autocomplete="username" />
+        </div>
+        <div>
+          <label>密码</label>
+          <input v-model="automationLoginPassword" type="password" autocomplete="current-password" />
+        </div>
+      </div>
+      <div class="flex" style="margin-top: 12px;">
+        <button class="secondary" @click="generateAutomationDraft" :disabled="automationRunning">生成 Playwright 草稿</button>
+        <button @click="runAutomation" :disabled="automationRunning || !automationScript || !automationConfirmed">执行</button>
+        <span v-if="automationMessage" class="notice">{{ automationMessage }}</span>
+      </div>
+      <div v-if="automationScript" style="margin-top: 12px;">
+        <label>Playwright 脚本</label>
+        <textarea class="script-area" v-model="automationScript"></textarea>
+      </div>
+      <div v-if="latestAutomationRun" class="automation-result">
+        <div class="result-head">
+          <span class="badge" :class="latestAutomationRun.passed ? 'status-approved' : 'status-rejected'">
+            {{ latestAutomationRun.passed ? '执行通过' : '执行失败' }}
+          </span>
+          <span class="muted">{{ latestAutomationRun.runner_type }} | {{ latestAutomationRun.duration_ms }} ms</span>
+        </div>
+        <div v-if="latestAutomationRun.error_message" class="notice error">{{ latestAutomationRun.error_message }}</div>
+        <div v-if="latestAutomationRun.analysis?.category && latestAutomationRun.analysis.category !== 'none'" class="notice">
+          {{ latestAutomationRun.analysis.category }}：{{ latestAutomationRun.analysis.reason }}
+        </div>
+        <pre class="text-block">{{ JSON.stringify(latestAutomationRun.evidence || {}, null, 2) }}</pre>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -111,6 +171,16 @@ const error = ref('');
 const message = ref('');
 const testCase = ref(null);
 const reviewResult = ref('');
+const automationBaseUrl = ref('http://127.0.0.1:5173');
+const automationLoginEnabled = ref(false);
+const automationLoginUrl = ref('/login');
+const automationLoginUsername = ref('');
+const automationLoginPassword = ref('');
+const automationScript = ref('');
+const automationConfirmed = ref(false);
+const automationRunning = ref(false);
+const automationMessage = ref('');
+const latestAutomationRun = ref(null);
 const parsedReview = computed(() => {
   if (!reviewResult.value) return null;
   if (typeof reviewResult.value === 'object') return reviewResult.value;
@@ -129,6 +199,17 @@ async function load() {
     testCase.value = { ...data };
     if (data.ai_review && data.ai_review.raw_result) {
       reviewResult.value = data.ai_review.raw_result;
+    }
+    latestAutomationRun.value = data.latest_automation_run || null;
+    if (latestAutomationRun.value?.script_text) {
+      automationScript.value = latestAutomationRun.value.script_text;
+    }
+    const latestLogin = latestAutomationRun.value?.spec?.test_data?.login;
+    if (latestLogin?.enabled) {
+      automationLoginEnabled.value = true;
+      automationLoginUrl.value = latestLogin.login_url || automationLoginUrl.value;
+      automationLoginUsername.value = latestLogin.username || '';
+      automationLoginPassword.value = '';
     }
   } catch (e) {
     error.value = e.message || '加载失败。';
@@ -171,5 +252,105 @@ async function runReview() {
   }
 }
 
+function buildAutomationPayload(extra = {}) {
+  const payload = {
+    base_url: automationBaseUrl.value,
+    ...extra
+  };
+  payload.login_info = automationLoginEnabled.value
+    ? {
+        enabled: true,
+        login_url: automationLoginUrl.value,
+        username: automationLoginUsername.value,
+        password: automationLoginPassword.value
+      }
+    : { enabled: false };
+  return payload;
+}
+
+async function generateAutomationDraft() {
+  if (!testCase.value) return;
+  automationRunning.value = true;
+  automationMessage.value = '';
+  try {
+    const data = await api.generateAutomationScript(testCase.value.id, buildAutomationPayload());
+    automationScript.value = data.script_text || '';
+    latestAutomationRun.value = data.latest_run || latestAutomationRun.value;
+    automationConfirmed.value = false;
+    automationMessage.value = data.success ? '草稿已生成。' : (data.message || '生成失败。');
+  } catch (e) {
+    automationMessage.value = e.message || '生成失败。';
+  } finally {
+    automationRunning.value = false;
+  }
+}
+
+async function runAutomation() {
+  if (!testCase.value || !automationScript.value || !automationConfirmed.value) return;
+  automationRunning.value = true;
+  automationMessage.value = '';
+  try {
+    const data = await api.runTestCaseAutomation(testCase.value.id, buildAutomationPayload({
+      script_text: automationScript.value,
+      confirmed: true
+    }));
+    latestAutomationRun.value = data.run || null;
+    automationMessage.value = latestAutomationRun.value?.passed ? '执行通过。' : '执行完成，存在失败。';
+  } catch (e) {
+    automationMessage.value = e.message || '执行失败。';
+  } finally {
+    automationRunning.value = false;
+  }
+}
+
 onMounted(load);
 </script>
+
+<style scoped>
+.check-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+}
+
+.check-line input {
+  width: auto;
+}
+
+.login-grid {
+  margin-top: 12px;
+}
+
+.script-area {
+  min-height: 280px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.automation-result {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.result-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.text-block {
+  background: var(--panel-soft);
+  border-radius: 8px;
+  padding: 10px;
+  white-space: pre-wrap;
+  font-size: 12px;
+  line-height: 1.5;
+}
+</style>

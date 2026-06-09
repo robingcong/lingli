@@ -8,6 +8,7 @@ import Upload from '../pages/Upload.vue';
 import Analyser from '../pages/Analyser.vue';
 import ApiCaseGenerate from '../pages/ApiCaseGenerate.vue';
 import PlaneGenerate from '../pages/PlaneGenerate.vue';
+import UiAutomationManage from '../pages/UiAutomationManage.vue';
 
 const routes = [
   { path: '/', name: 'dashboard', component: Dashboard },
@@ -18,7 +19,8 @@ const routes = [
   { path: '/knowledge', name: 'knowledge', component: Knowledge },
   { path: '/upload', name: 'upload', component: Upload },
   { path: '/analyser', name: 'analyser', component: Analyser },
-  { path: '/api-case-generate', name: 'api-case-generate', component: ApiCaseGenerate }
+  { path: '/api-case-generate', name: 'api-case-generate', component: ApiCaseGenerate },
+  { path: '/ui-automation', name: 'ui-automation', component: UiAutomationManage }
 ];
 
 export default createRouter({

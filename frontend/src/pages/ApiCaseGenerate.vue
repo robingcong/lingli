@@ -117,6 +117,32 @@
       </div>
       <div class="muted">接口数 {{ detail.selected_api_count }} | 用例数 {{ detail.generated_cases }}</div>
 
+      <div class="automation-panel">
+        <div class="form-grid">
+          <div>
+            <label>Base URL</label>
+            <input v-model="automationBaseUrl" placeholder="http://127.0.0.1:8000" />
+          </div>
+          <div>
+            <label>执行</label>
+            <button @click="runApiAutomation" :disabled="automationRunning || !detailApis.length">执行首条 API 用例</button>
+          </div>
+        </div>
+        <div v-if="automationMessage" class="notice">{{ automationMessage }}</div>
+        <div v-if="latestAutomationRun" class="automation-result">
+          <div class="result-head">
+            <span class="badge" :class="latestAutomationRun.passed ? 'status-approved' : 'status-rejected'">
+              {{ latestAutomationRun.passed ? '执行通过' : '执行失败' }}
+            </span>
+            <span class="muted">{{ latestAutomationRun.runner_type }} | {{ latestAutomationRun.duration_ms }} ms</span>
+          </div>
+          <div v-if="latestAutomationRun.analysis?.category && latestAutomationRun.analysis.category !== 'none'" class="notice">
+            {{ latestAutomationRun.analysis.category }}：{{ latestAutomationRun.analysis.reason }}
+          </div>
+          <pre class="text-block">{{ JSON.stringify(latestAutomationRun.evidence || {}, null, 2) }}</pre>
+        </div>
+      </div>
+
       <div class="points" v-if="detailApis.length">
         <details v-for="apiItem in detailApis" :key="apiItem.path" class="tp-item">
           <summary>
@@ -164,6 +190,10 @@ const loadingHistory = ref(false);
 const historyError = ref('');
 const detail = ref(null);
 const historyLoadedForTask = ref(false);
+const automationBaseUrl = ref('http://127.0.0.1:8000');
+const automationRunning = ref(false);
+const automationMessage = ref('');
+const latestAutomationRun = ref(null);
 
 let logSource = null;
 let pollTimer = null;
@@ -236,6 +266,7 @@ async function upload() {
           generated_cases: detailParsed.value?.apiDefinitions?.length || 0,
           selected_api_count: apiList.value.length
         };
+        latestAutomationRun.value = null;
         await loadHistory();
         message.value = '生成成功。';
       } else if (data.task_id) {
@@ -429,9 +460,28 @@ async function openHistoryDetail(id) {
     const data = await api.getApiCaseGenerationDetail(id);
     if (data.success) {
       detail.value = data.item;
+      latestAutomationRun.value = data.item.latest_automation_run || null;
     }
   } catch (e) {
     historyError.value = e.message || '获取详情失败。';
+  }
+}
+
+async function runApiAutomation() {
+  if (!detail.value?.id) return;
+  automationRunning.value = true;
+  automationMessage.value = '';
+  try {
+    const data = await api.runApiCaseGenerationAutomation(detail.value.id, {
+      base_url: automationBaseUrl.value,
+      case_index: 0
+    });
+    latestAutomationRun.value = data.run || null;
+    automationMessage.value = latestAutomationRun.value?.passed ? '执行通过。' : '执行完成，存在失败。';
+  } catch (e) {
+    automationMessage.value = e.message || '执行失败。';
+  } finally {
+    automationRunning.value = false;
   }
 }
 
@@ -487,6 +537,24 @@ onMounted(() => {
   display: grid;
   gap: 12px;
   margin-top: 12px;
+}
+
+.automation-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.automation-result {
+  display: grid;
+  gap: 10px;
+}
+
+.result-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
 }
 
 .tp-item {

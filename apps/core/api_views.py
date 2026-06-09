@@ -6,8 +6,22 @@ from django.db import connection
 from django.db.models import Q
 import json
 import time
+from typing import Any, Dict
 
-from .models import TestCase, PlaneWorkItem, TestCaseGenerationJob
+from .models import ApiCaseGeneration, AutomationRun, TestCase, PlaneWorkItem, TestCaseGenerationJob
+from .automation.analysis import build_failure_analysis
+from .automation.persistence import ensure_automation_run_table, save_automation_run
+from .automation.serializers import (
+    serialize_automation_run,
+    serialize_latest_automation_run,
+    serialize_recent_automation_runs,
+)
+from .automation.specs import (
+    build_api_specs_from_generation,
+    build_ui_spec_from_test_case,
+    generate_playwright_script,
+)
+from .automation.runners import execute_api_spec, execute_playwright_script
 from .fetch_work_items import sync_work_items_to_db
 from .title_utils import build_test_case_title
 from .generation_jobs import (
@@ -162,6 +176,7 @@ def test_cases_list(request):
                 'raw_result': ai_review.raw_result,
                 'updated_at': ai_review.updated_at.isoformat()
             } if ai_review else None,
+            'latest_automation_run': serialize_latest_automation_run("test_case", tc.id),
         })
 
     return JsonResponse({
@@ -228,6 +243,232 @@ def generation_job_detail(request, job_id):
     if not job:
         return JsonResponse({"success": False, "message": "未找到生成任务"}, status=404)
     return JsonResponse({"success": True, **serialize_generation_job_detail(job)})
+
+
+def _read_json_body(request) -> Dict[str, Any]:
+    try:
+        return json.loads(request.body or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError("无效的JSON数据") from exc
+
+
+@require_http_methods(["POST"])
+def api_case_generation_automation_run(request, generation_id: int):
+    try:
+        payload = _read_json_body(request)
+        generation = ApiCaseGeneration.objects.select_related("schema_file").get(id=generation_id)
+    except ValueError as exc:
+        return JsonResponse({"success": False, "message": str(exc)}, status=400)
+    except ApiCaseGeneration.DoesNotExist:
+        return JsonResponse({"success": False, "message": "记录不存在"}, status=404)
+
+    specs = build_api_specs_from_generation(generation, base_url=payload.get("base_url") or "")
+    if not specs:
+        return JsonResponse({"success": False, "message": "没有可执行的接口用例"}, status=400)
+    try:
+        case_index = int(payload.get("case_index", 0) or 0)
+    except Exception:
+        case_index = 0
+    if case_index < 0 or case_index >= len(specs):
+        return JsonResponse({"success": False, "message": "case_index 超出范围"}, status=400)
+
+    spec = specs[case_index]
+    result = execute_api_spec(spec)
+    analysis = build_failure_analysis(result)
+    run = save_automation_run(
+        source_type="api_case_generation",
+        source_id=str(generation.id),
+        runner_type="api_requests",
+        spec=spec,
+        result=result,
+        analysis=analysis,
+    )
+    return JsonResponse({"success": True, "run": serialize_automation_run(run)})
+
+
+@require_http_methods(["POST"])
+def test_case_automation_script(request, test_case_id: int):
+    try:
+        payload = _read_json_body(request)
+        test_case = TestCase.objects.get(id=test_case_id)
+    except ValueError as exc:
+        return JsonResponse({"success": False, "message": str(exc)}, status=400)
+    except TestCase.DoesNotExist:
+        return JsonResponse({"success": False, "message": "测试用例不存在"}, status=404)
+
+    spec = build_ui_spec_from_test_case(
+        test_case,
+        base_url=payload.get("base_url") or "",
+        login_info=payload.get("login_info"),
+    )
+    return JsonResponse({
+        "success": True,
+        "spec": spec,
+        "script_text": generate_playwright_script(spec),
+        "latest_run": serialize_latest_automation_run("test_case", test_case.id),
+    })
+
+
+@require_http_methods(["POST"])
+def test_case_automation_run(request, test_case_id: int):
+    try:
+        payload = _read_json_body(request)
+        test_case = TestCase.objects.get(id=test_case_id)
+    except ValueError as exc:
+        return JsonResponse({"success": False, "message": str(exc)}, status=400)
+    except TestCase.DoesNotExist:
+        return JsonResponse({"success": False, "message": "测试用例不存在"}, status=404)
+
+    if payload.get("confirmed") is not True:
+        return JsonResponse({"success": False, "message": "执行前必须人工确认 Playwright 脚本"}, status=400)
+
+    spec = build_ui_spec_from_test_case(
+        test_case,
+        base_url=payload.get("base_url") or "",
+        login_info=payload.get("login_info"),
+    )
+    script_text = payload.get("script_text") or generate_playwright_script(spec)
+    try:
+        timeout = int(payload.get("timeout") or 60)
+    except Exception:
+        timeout = 60
+    result = execute_playwright_script(
+        script_text=script_text,
+        base_url=payload.get("base_url") or "http://127.0.0.1:5173",
+        timeout=timeout,
+        login_info=payload.get("login_info"),
+    )
+    analysis = build_failure_analysis(result)
+    run = save_automation_run(
+        source_type="test_case",
+        source_id=str(test_case.id),
+        runner_type="playwright",
+        spec=spec,
+        result=result,
+        analysis=analysis,
+        script_text=script_text,
+    )
+    return JsonResponse({"success": True, "run": serialize_automation_run(run)})
+
+
+@require_http_methods(["GET"])
+def test_case_automation_runs(request, test_case_id: int):
+    return JsonResponse({
+        "success": True,
+        "items": serialize_recent_automation_runs("test_case", test_case_id),
+    })
+
+
+@require_http_methods(["GET"])
+def api_case_generation_automation_runs(request, generation_id: int):
+    return JsonResponse({
+        "success": True,
+        "items": serialize_recent_automation_runs("api_case_generation", generation_id),
+    })
+
+
+def _int_query(value: str, default: int, *, min_value: int, max_value: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+    return max(min_value, min(max_value, parsed))
+
+
+@require_http_methods(["GET"])
+def ui_automation_test_cases(request):
+    ensure_automation_run_table()
+    status_filter = (request.GET.get("status") or "approved").strip()
+    automation_status = (request.GET.get("automation_status") or "all").strip()
+    keyword = (request.GET.get("keyword") or "").strip()
+    page = _int_query(request.GET.get("page"), 1, min_value=1, max_value=100000)
+    page_size = _int_query(request.GET.get("page_size"), 15, min_value=1, max_value=50)
+
+    qs = TestCase.objects.all().order_by("-updated_at", "-created_at", "-id")
+    if status_filter and status_filter != "all":
+        qs = qs.filter(status=status_filter)
+    summary_candidates = list(qs)
+    if keyword:
+        qs = qs.filter(
+            Q(title__icontains=keyword)
+            | Q(description__icontains=keyword)
+            | Q(requirements__icontains=keyword)
+            | Q(test_steps__icontains=keyword)
+            | Q(expected_results__icontains=keyword)
+        )
+
+    candidates = list(qs)
+    case_ids = [str(case.id) for case in summary_candidates]
+    latest_runs = {}
+    if case_ids:
+        runs = (
+            AutomationRun.objects
+            .filter(source_type="test_case", runner_type="playwright", source_id__in=case_ids)
+            .order_by("-created_at", "-id")
+        )
+        for run in runs:
+            latest_runs.setdefault(run.source_id, run)
+
+    summary = {
+        "total": len(summary_candidates),
+        "with_runs": 0,
+        "passed": 0,
+        "failed": 0,
+        "unrun": 0,
+    }
+    for case in summary_candidates:
+        run = latest_runs.get(str(case.id))
+        if run:
+            summary["with_runs"] += 1
+            if run.passed:
+                summary["passed"] += 1
+            else:
+                summary["failed"] += 1
+        else:
+            summary["unrun"] += 1
+
+    rows = []
+    for case in candidates:
+        run = latest_runs.get(str(case.id))
+        if automation_status == "passed" and not (run and run.passed):
+            continue
+        if automation_status == "failed" and not (run and not run.passed):
+            continue
+        if automation_status == "unrun" and run:
+            continue
+        rows.append((case, run))
+
+    paginator = Paginator(rows, page_size)
+    try:
+        page_obj = paginator.page(page)
+    except EmptyPage:
+        page_obj = paginator.page(paginator.num_pages if paginator.num_pages else 1)
+
+    items = []
+    for case, run in page_obj.object_list:
+        items.append({
+            "id": case.id,
+            "title": case.title,
+            "description": case.description,
+            "requirements": case.requirements,
+            "test_steps": case.test_steps,
+            "expected_results": case.expected_results,
+            "status": case.status,
+            "llm_provider": case.llm_provider or "",
+            "created_at": case.created_at.isoformat(),
+            "updated_at": case.updated_at.isoformat() if case.updated_at else "",
+            "latest_automation_run": serialize_automation_run(run),
+        })
+
+    return JsonResponse({
+        "success": True,
+        "summary": summary,
+        "items": items,
+        "page": page_obj.number,
+        "page_size": page_size,
+        "total": paginator.count,
+        "total_pages": paginator.num_pages,
+    })
 
 
 @require_http_methods(["GET", "POST"])
